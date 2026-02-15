@@ -40,6 +40,7 @@ import argparse
 import json
 import math
 import os
+import random
 import re
 from collections import Counter
 from datetime import datetime, timezone
@@ -189,22 +190,83 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
         print(f"  [profiles] Collecting metadata for {len(authors)} unique accounts...")
 
         profiles = {}
+        consecutive_fails = 0
+        base_delay = 2.0  # seconds
+
         for i, handle in enumerate(authors):
             if not handle:
                 continue
+
+            # Adaptive delay: slow down as we go, jitter to look human
+            delay = base_delay + (i * 0.3)  # Gradually slower
+            delay += random.uniform(0.5, 2.5)  # Random jitter
+            if consecutive_fails > 0:
+                # Exponential backoff on failures
+                backoff = min(60, base_delay * (2 ** consecutive_fails))
+                print(f"    [throttle] Rate limited — waiting {backoff:.0f}s before retry...")
+                await page.wait_for_timeout(int(backoff * 1000))
+
             try:
                 profile = await collect_profile(page, handle)
-                profiles[handle] = profile
-                print(f"    [{i+1}/{len(authors)}] @{handle}: {profile.get('followers', '?')} followers, joined {profile.get('joined', '?')}")
+
+                # Detect rate limiting: empty profile = likely blocked
+                has_data = any(k in profile for k in ("bio", "followers", "display_name", "joined"))
+                if not has_data and not profile.get("error"):
+                    consecutive_fails += 1
+                    print(f"    [{i+1}/{len(authors)}] @{handle}: EMPTY (possible rate limit, {consecutive_fails} in a row)")
+                    profiles[handle] = {"handle": handle, "error": "rate_limited"}
+                else:
+                    consecutive_fails = 0  # Reset on success
+                    profiles[handle] = profile
+                    print(f"    [{i+1}/{len(authors)}] @{handle}: {profile.get('followers', '?')} followers, joined {profile.get('joined', '?')}")
+
             except Exception as e:
+                consecutive_fails += 1
                 print(f"    [{i+1}/{len(authors)}] @{handle}: FAILED ({e})")
                 profiles[handle] = {"handle": handle, "error": str(e)}
-            await page.wait_for_timeout(1500)  # Rate limiting
+
+            # Save progress every 10 profiles
+            if (i + 1) % 10 == 0:
+                _save_progress(posts, profiles, query, script_dir)
+                print(f"    [checkpoint] Saved {len(profiles)}/{len(authors)} profiles")
+
+            # If 5+ consecutive fails, take a long breather
+            if consecutive_fails >= 5:
+                breather = random.uniform(45, 90)
+                print(f"    [breather] {consecutive_fails} consecutive failures — pausing {breather:.0f}s to reset rate limit...")
+                await page.wait_for_timeout(int(breather * 1000))
+                # Navigate to home to reset the session
+                try:
+                    await page.goto("https://x.com/home", wait_until="domcontentloaded")
+                    await page.wait_for_timeout(3000)
+                except:
+                    pass
+                consecutive_fails = 0  # Reset and try again
+
+            await page.wait_for_timeout(int(delay * 1000))
+
+        # Final save
+        _save_progress(posts, profiles, query, script_dir)
 
         # Close the persistent context (saves cookies/state automatically)
         await context.close()
 
     return posts, profiles
+
+
+def _save_progress(posts, profiles, query, script_dir):
+    """Save partial results so nothing is lost if rate-limited or interrupted."""
+    progress = {
+        "query": query,
+        "posts": posts,
+        "profiles": profiles,
+        "partial": True,
+        "saved_at": datetime.utcnow().isoformat(),
+    }
+    path = os.path.join(script_dir, "coordination_progress.json")
+    with open(path, "w") as f:
+        json.dump(progress, f, indent=2, default=str)
+    return path
 
 
 async def extract_post(article):
@@ -656,71 +718,143 @@ def analyze_bio_clustering(profiles):
 
 
 def compute_coordination_score(text, temporal, accounts, bios):
-    """Compute overall coordination probability."""
-    scores = []
+    """Compute overall coordination probability.
+
+    Key insight: we must distinguish between "people with similar views
+    discussing the same topic" (organic) and "identical text copy-pasted
+    across accounts in a burst" (coordinated). The difference is:
+
+    - Organic: high phrase match (they're all talking about X) but
+      HIGH uniqueness (each person says it differently) and
+      spread-out timing (natural discovery over days).
+
+    - Coordinated: high phrase match AND low uniqueness (copy-paste)
+      AND temporal bursts AND network homogeneity all together.
+
+    The score only goes high when MULTIPLE independent signals align.
+    Any single signal alone caps at ~0.4 (POSSIBLY COORDINATED).
+    """
+    components = {}
     reasons = []
 
-    # Text similarity (0-1)
+    # ── 1. TEXT DUPLICATION (the strongest signal) ──
+    # Not just "do they mention the phrase?" but "are they copy-pasting?"
     if "phrase_match_rate" in text:
         pmr = text["phrase_match_rate"]
         uniqueness = text.get("uniqueness_ratio", 1.0)
-        text_score = pmr * (1 - uniqueness * 0.5)  # High match rate + low uniqueness = coordinated
-        scores.append(("text_similarity", min(text_score * 1.5, 1.0)))
-        if pmr > 0.5:
-            reasons.append(f"{pmr*100:.0f}% of posts contain the exact target phrase")
-        if uniqueness < 0.5:
-            reasons.append(f"Only {uniqueness*100:.0f}% unique texts (high duplication)")
+        n_dupes = text.get("exact_duplicate_posts", 0)
+        n_near = text.get("near_duplicate_pairs", 0)
+        n_total = text.get("total_texts", 1)
 
-    # Temporal clustering (0-1)
+        # Exact duplicates are the gold standard of coordination
+        dupe_rate = n_dupes / max(n_total, 1)
+        near_dupe_rate = n_near / max(n_total * (n_total - 1) / 2, 1)  # fraction of all pairs
+
+        # Organic patterns: people mention the same phrase but say different things
+        # Coordinated: exact copy-paste with minor variations
+        # Key: low uniqueness = many identical texts = coordination
+        copy_paste_signal = (1 - uniqueness)  # 0 = all unique, 1 = all identical
+
+        # Combine: phrase match matters less than actual duplication
+        text_score = (
+            copy_paste_signal * 0.5 +    # Are they copy-pasting? (most important)
+            dupe_rate * 0.3 +              # Exact duplicates
+            near_dupe_rate * 0.2           # Near-duplicates
+        )
+
+        components["text_duplication"] = min(text_score, 1.0)
+        if copy_paste_signal > 0.4:
+            reasons.append(f"Only {uniqueness*100:.0f}% unique texts — significant copy-pasting detected")
+        if n_dupes > 2:
+            reasons.append(f"{n_dupes} posts are exact duplicates")
+        if pmr > 0.7:
+            reasons.append(f"{pmr*100:.0f}% of posts contain the exact search phrase")
+
+    # ── 2. TEMPORAL CLUSTERING ──
+    # Use log-scaled p-value so it's not binary
     if "poisson_p_value" in temporal:
-        p_val = temporal["poisson_p_value"]
-        temp_score = 1 - p_val  # Lower p-value = more coordinated
-        scores.append(("temporal_clustering", min(temp_score, 1.0)))
+        p_val = max(temporal["poisson_p_value"], 1e-10)
+        # Log scale: p=0.05 → 0.26, p=0.01 → 0.40, p=0.001 → 0.60, p=0.0001 → 0.80
+        import math as _math
+        temp_score = min(1.0, max(0, -_math.log10(p_val) / 5.0))
+        components["temporal_clustering"] = temp_score
         if p_val < 0.01:
-            reasons.append(f"Temporal clustering p={p_val:.4f} (highly non-random)")
+            reasons.append(f"Temporal clustering p={p_val:.6f} (statistically significant)")
+        elif p_val < 0.05:
+            reasons.append(f"Temporal clustering p={p_val:.4f} (borderline)")
 
-    # Network homogeneity (0-1)
+    # ── 3. NETWORK HOMOGENEITY ──
+    # Only counts if there's ALSO text duplication. A bunch of Musk fans
+    # tweeting different things about the same topic = organic.
     if "network_signals" in bios:
         musk_pct = bios["network_signals"].get("musk_adjacent_pct", 0) / 100
-        if musk_pct > 0.3:
-            scores.append(("network_homogeneity", min(musk_pct, 1.0)))
-            reasons.append(f"{musk_pct*100:.0f}% of accounts are Musk-adjacent")
+        total_bios = bios.get("total_bios", 1)
 
-    # Account profile anomalies (0-1)
+        # Count distinct keyword clusters — more homogeneous = more suspicious
+        shared_kw = bios.get("shared_keywords", {})
+        # How many bios share the same keywords (as fraction of total)
+        kw_saturation = max(shared_kw.values()) / total_bios if shared_kw and total_bios > 0 else 0
+
+        net_score = max(musk_pct, kw_saturation) * 0.7  # Cap contribution
+        components["network_homogeneity"] = min(net_score, 1.0)
+        if musk_pct > 0.5:
+            reasons.append(f"{musk_pct*100:.0f}% of accounts are Musk-adjacent")
+        if kw_saturation > 0.4:
+            top_kw = max(shared_kw, key=shared_kw.get)
+            reasons.append(f"'{top_kw}' appears in {shared_kw[top_kw]}/{total_bios} bios ({kw_saturation*100:.0f}%)")
+
+    # ── 4. ACCOUNT ANOMALIES ──
     if "ratio_stats" in accounts:
         suspicious = accounts["ratio_stats"].get("suspicious_ratio_count", 0)
         total = accounts.get("profiles_with_data", 1)
         if total > 0:
             anomaly_rate = suspicious / total
-            if anomaly_rate > 0.2:
-                scores.append(("account_anomalies", min(anomaly_rate, 1.0)))
+            if anomaly_rate > 0.15:
+                components["account_anomalies"] = min(anomaly_rate, 1.0)
                 reasons.append(f"{anomaly_rate*100:.0f}% of accounts have suspicious follower ratios")
 
-    # Combine scores (weighted average)
-    if scores:
-        weights = {
-            "text_similarity": 0.35,
-            "temporal_clustering": 0.30,
-            "network_homogeneity": 0.20,
-            "account_anomalies": 0.15,
-        }
-        total_weight = sum(weights.get(name, 0.1) for name, _ in scores)
-        weighted_sum = sum(weights.get(name, 0.1) * score for name, score in scores)
-        final_score = weighted_sum / total_weight
-    else:
+    # ── FINAL SCORE: require convergence of multiple signals ──
+    if not components:
         final_score = 0
+    else:
+        # Weighted average as base
+        weights = {
+            "text_duplication": 0.40,      # Copy-paste is king
+            "temporal_clustering": 0.25,    # Timing matters
+            "network_homogeneity": 0.20,    # Who they are
+            "account_anomalies": 0.15,      # Suspicious accounts
+        }
+        total_weight = sum(weights.get(name, 0.1) for name in components)
+        weighted_sum = sum(weights.get(name, 0.1) * score for name, score in components.items())
+        base_score = weighted_sum / total_weight if total_weight > 0 else 0
+
+        # Convergence bonus: multiple independent signals reinforce each other
+        # 1 signal alone: capped at 0.4 (POSSIBLY)
+        # 2 signals: up to 0.6 (LIKELY)
+        # 3+ signals: up to 1.0 (HIGHLY LIKELY)
+        active_signals = sum(1 for s in components.values() if s > 0.2)
+
+        if active_signals <= 1:
+            # Single signal — cap it. Could be organic.
+            final_score = min(base_score, 0.40)
+        elif active_signals == 2:
+            final_score = min(base_score * 1.1, 0.70)
+        else:
+            # 3+ independent signals converging = strong evidence
+            final_score = min(base_score * 1.2, 1.0)
 
     verdict = (
         "HIGHLY LIKELY COORDINATED" if final_score > 0.7 else
         "LIKELY COORDINATED" if final_score > 0.5 else
         "POSSIBLY COORDINATED" if final_score > 0.3 else
-        "INSUFFICIENT EVIDENCE"
+        "LIKELY ORGANIC"
     )
 
     return {
         "score": round(final_score, 3),
         "verdict": verdict,
-        "component_scores": {name: round(s, 3) for name, s in scores},
+        "component_scores": {name: round(s, 3) for name, s in components.items()},
+        "active_signals": sum(1 for s in components.values() if s > 0.2),
         "reasons": reasons,
     }
 
@@ -981,14 +1115,26 @@ async def wizard():
 
     # Step 1: Choose mode
     step(1, "What would you like to do?")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    progress_file = os.path.join(script_dir, "coordination_progress.json")
+    has_progress = os.path.exists(progress_file)
+
     print(f"""
       {C.PURPLE}a){C.RESET} Search X for a phrase           {C.DIM}(opens browser, you log in){C.RESET}
       {C.PURPLE}b){C.RESET} Run demo with sample data       {C.DIM}(no login needed, test the tool){C.RESET}
-      {C.PURPLE}c){C.RESET} Analyze existing JSON report     {C.DIM}(re-run analysis on saved data){C.RESET}
-""")
-    mode = ask("Choose a, b, or c", "a").lower()
+      {C.PURPLE}c){C.RESET} Analyze existing JSON report     {C.DIM}(re-run analysis on saved data){C.RESET}""")
+    if has_progress:
+        with open(progress_file) as f:
+            prog = json.load(f)
+        prog_posts = len(prog.get("posts", []))
+        prog_profiles = len(prog.get("profiles", {}))
+        prog_authors = len(set(p.get("author_handle", "") for p in prog.get("posts", []) if p.get("author_handle")))
+        prog_remaining = prog_authors - prog_profiles
+        print(f"""      {C.YELLOW}d){C.RESET} Resume previous scan            {C.DIM}({prog_posts} posts, {prog_profiles}/{prog_authors} profiles — {prog_remaining} remaining){C.RESET}""")
+    print()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mode = ask("Choose " + ("a, b, c, or d" if has_progress else "a, b, or c"), "a").lower()
 
     if mode == "b":
         await run_demo(script_dir)
@@ -1005,6 +1151,10 @@ async def wizard():
         print("\n" + text_report)
         if confirm("Open 3D visualization?"):
             open_visualization(script_dir, json_path, report)
+        return
+
+    if mode == "d" and has_progress:
+        await resume_scan(script_dir, progress_file)
         return
 
     # Mode A: Full search
@@ -1121,6 +1271,142 @@ async def wizard():
   {C.DIM}Share the report. Fork the tool. Sunlight is the best disinfectant.{C.RESET}
   {C.DIM}github.com/Cosmolalia/Lysis-Unraveler{C.RESET}
 """)
+
+
+async def resume_scan(script_dir, progress_file):
+    """Resume a previous scan that was interrupted (e.g. by rate limiting)."""
+    with open(progress_file) as f:
+        prog = json.load(f)
+
+    posts = prog.get("posts", [])
+    existing_profiles = prog.get("profiles", {})
+    query = prog.get("query", "")
+
+    authors = list(set(p.get("author_handle", "") for p in posts if p.get("author_handle")))
+    remaining = [h for h in authors if h not in existing_profiles or existing_profiles.get(h, {}).get("error") == "rate_limited"]
+
+    step(2, f"Resuming scan: {len(remaining)} profiles remaining")
+    info(f"Query: \"{query}\"")
+    info(f"Posts already collected: {len(posts)}")
+    info(f"Profiles done: {len(authors) - len(remaining)}/{len(authors)}")
+    print()
+
+    if not remaining:
+        success("All profiles already collected! Running analysis...")
+    else:
+        if not confirm(f"Resume collecting {len(remaining)} profiles?"):
+            info("Cancelled.")
+            return
+
+        # Check Playwright
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            error("Playwright not installed! Run: pip install playwright && playwright install chromium")
+            return
+
+        step(3, f"Opening browser to collect {len(remaining)} remaining profiles...")
+        info("Log into X if prompted, then press Enter.")
+        print()
+
+        import shutil
+        profile_dir = os.path.join(script_dir, ".browser_profile")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        async with async_playwright() as p:
+            sys_chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+            launch_opts = {"headless": False}
+            if sys_chromium:
+                launch_opts["executable_path"] = sys_chromium
+
+            context = await p.chromium.launch_persistent_context(
+                profile_dir,
+                **launch_opts,
+                args=["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
+                ignore_default_args=["--enable-automation"],
+            )
+
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.goto("https://x.com", wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+
+            # Check login
+            loop = asyncio.get_event_loop()
+            search = await page.query_selector('a[href="/explore"]')
+            if not search:
+                info("Please log in to X in the browser window.")
+                await loop.run_in_executor(None, input, "\n  Press ENTER when logged in > ")
+                await page.wait_for_timeout(2000)
+
+            consecutive_fails = 0
+            base_delay = 2.0
+
+            for i, handle in enumerate(remaining):
+                delay = base_delay + (i * 0.3) + random.uniform(0.5, 2.5)
+                if consecutive_fails > 0:
+                    backoff = min(60, base_delay * (2 ** consecutive_fails))
+                    print(f"    [throttle] Rate limited — waiting {backoff:.0f}s...")
+                    await page.wait_for_timeout(int(backoff * 1000))
+
+                try:
+                    profile = await collect_profile(page, handle)
+                    has_data = any(k in profile for k in ("bio", "followers", "display_name", "joined"))
+                    if not has_data and not profile.get("error"):
+                        consecutive_fails += 1
+                        print(f"    [{i+1}/{len(remaining)}] @{handle}: EMPTY (rate limit? {consecutive_fails} in a row)")
+                        existing_profiles[handle] = {"handle": handle, "error": "rate_limited"}
+                    else:
+                        consecutive_fails = 0
+                        existing_profiles[handle] = profile
+                        print(f"    [{i+1}/{len(remaining)}] @{handle}: {profile.get('followers', '?')} followers")
+                except Exception as e:
+                    consecutive_fails += 1
+                    print(f"    [{i+1}/{len(remaining)}] @{handle}: FAILED ({e})")
+                    existing_profiles[handle] = {"handle": handle, "error": str(e)}
+
+                if (i + 1) % 10 == 0:
+                    _save_progress(posts, existing_profiles, query, script_dir)
+                    print(f"    [checkpoint] Saved {i+1}/{len(remaining)}")
+
+                if consecutive_fails >= 5:
+                    breather = random.uniform(45, 90)
+                    print(f"    [breather] Pausing {breather:.0f}s to reset rate limit...")
+                    await page.wait_for_timeout(int(breather * 1000))
+                    try:
+                        await page.goto("https://x.com/home", wait_until="domcontentloaded")
+                        await page.wait_for_timeout(3000)
+                    except:
+                        pass
+                    consecutive_fails = 0
+
+                await page.wait_for_timeout(int(delay * 1000))
+
+            _save_progress(posts, existing_profiles, query, script_dir)
+            await context.close()
+
+    # Now run the full analysis
+    step(4, "Running coordination analysis...")
+    report = analyze_coordination(posts, existing_profiles, query)
+
+    text_report = generate_report(report)
+    print("\n" + text_report)
+
+    output_path = os.path.join(script_dir, "coordination_report.json")
+    with open(output_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    success(f"JSON report  → {output_path}")
+
+    text_path = output_path.replace(".json", "_report.txt")
+    with open(text_path, "w") as f:
+        f.write(text_report)
+    success(f"Text report  → {text_path}")
+
+    if confirm("Open 3D visualization?"):
+        open_visualization(script_dir, output_path, report)
+
+    # Clean up progress file
+    os.remove(progress_file)
+    success("Progress file cleaned up. Full report saved.")
 
 
 async def run_demo(script_dir):
