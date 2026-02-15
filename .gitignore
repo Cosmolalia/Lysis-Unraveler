@@ -1,0 +1,14 @@
+# Browser automation profile
+.browser_profile/
+
+# Generated reports (user-specific data)
+coordination_report.json
+coordination_report_report.txt
+coordination_report_viz.html
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store

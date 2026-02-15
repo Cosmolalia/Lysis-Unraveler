@@ -64,10 +64,10 @@
   #meter .reasons li { margin-bottom: 3px; list-style: none; }
   #meter .reasons li::before { content: "→ "; color: #7c5cff; }
 
-  /* ── Similarity Heatmap ── */
+  /* ── Similarity Panel ── */
   #similarity-panel {
     position: fixed; top: 60px; left: 16px;
-    width: 240px;
+    width: 320px;
     max-height: calc(100vh - 80px);
     overflow-y: auto;
     background: rgba(15, 15, 25, 0.95);
@@ -78,12 +78,34 @@
     display: none;
   }
   #similarity-panel h3 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
-  .sim-row { display: flex; align-items: center; margin-bottom: 4px; font-size: 10px; cursor: pointer; }
-  .sim-row:hover { background: rgba(124, 92, 255, 0.1); }
+  .sim-entry { margin-bottom: 2px; font-size: 10px; border-radius: 4px; }
+  .sim-row { display: flex; align-items: center; padding: 3px 4px; cursor: pointer; border-radius: 4px; }
+  .sim-row:hover { background: rgba(124, 92, 255, 0.15); }
+  .sim-row.expanded { background: rgba(124, 92, 255, 0.1); }
   .sim-bar-bg { flex: 1; height: 4px; background: #1a1a2e; border-radius: 2px; margin: 0 6px; }
   .sim-bar-fill { height: 100%; border-radius: 2px; }
-  .sim-handle { width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #aaa; }
+  .sim-handle { width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #aaa; }
   .sim-pct { width: 32px; text-align: right; color: #666; }
+  .sim-arrow { width: 12px; color: #444; font-size: 8px; text-align: center; transition: transform 0.2s; }
+  .sim-arrow.open { transform: rotate(90deg); }
+  .sim-detail {
+    display: none; padding: 6px 8px; margin: 2px 0 6px 0;
+    background: rgba(10, 10, 20, 0.8); border-radius: 4px;
+    border-left: 2px solid #7c5cff; font-size: 9px;
+  }
+  .sim-detail.open { display: block; }
+  .sim-detail .sd-name { color: #7c5cff; font-weight: 600; font-size: 11px; margin-bottom: 3px; }
+  .sim-detail .sd-meta { color: #555; margin-bottom: 4px; }
+  .sim-detail .sd-bio { color: #888; margin-bottom: 5px; font-style: italic; }
+  .sim-detail .sd-text { color: #ccc; padding: 4px 6px; background: #0a0a14; border-radius: 3px; margin-bottom: 5px; line-height: 1.4; }
+  .sim-detail .sd-links { display: flex; gap: 8px; }
+  .sim-detail .sd-links a { color: #5c9cff; text-decoration: none; }
+  .sim-detail .sd-links a:hover { text-decoration: underline; }
+  .sim-detail .sd-flags { margin-top: 4px; }
+  .sim-detail .sd-flag { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 8px; font-weight: 600; margin-right: 4px; }
+  .sd-flag.red { background: rgba(255, 51, 102, 0.2); color: #ff3366; }
+  .sd-flag.orange { background: rgba(255, 153, 51, 0.2); color: #ff9933; }
+  .sd-flag.purple { background: rgba(124, 92, 255, 0.2); color: #7c5cff; }
 
   /* ── Timeline ── */
   #timeline {
@@ -664,6 +686,8 @@ function buildSimilarityPanel(posts) {
   const list = document.getElementById('sim-list');
   list.innerHTML = '';
 
+  const query = (reportData?.query || '').toLowerCase();
+
   // Calculate each post's max similarity to any other post
   const sims = posts.map((p, i) => {
     let maxSim = 0;
@@ -673,38 +697,104 @@ function buildSimilarityPanel(posts) {
         if (s > maxSim) maxSim = s;
       }
     });
-    return { handle: p.handle, sim: maxSim, index: i };
+    return { post: p, handle: p.handle, sim: maxSim, index: i };
   });
 
   // Sort by similarity descending
   sims.sort((a, b) => b.sim - a.sim);
 
   sims.forEach(s => {
-    const row = document.createElement('div');
-    row.className = 'sim-row';
-    row.onclick = () => {
-      // Find and click the node
-      const nodes = graph.graphData().nodes;
-      const node = nodes.find(n => n.handle === s.handle);
-      if (node) {
-        showDetail(node);
-        graph.cameraPosition(
-          { x: node.x + 80, y: node.y + 40, z: node.z + 80 },
-          { x: node.x, y: node.y, z: node.z },
-          1000
-        );
-      }
-    };
+    const p = s.post;
+    const entry = document.createElement('div');
+    entry.className = 'sim-entry';
 
     const pct = (s.sim * 100).toFixed(0);
     const color = s.sim > 0.7 ? '#ff3366' : s.sim > 0.4 ? '#ff9933' : '#33ccff';
 
+    // Build flags
+    const text = (p.text_snippet || '').toLowerCase();
+    const bio = (p.bio || '').toLowerCase();
+    const containsPhrase = query && text.includes(query);
+    const muskAdj = ['elon', 'musk', 'tesla', 'spacex', 'grok'].some(k => bio.includes(k));
+    const isSeed = s.index === 0; // first post chronologically in original array
+
+    let flagsHtml = '';
+    if (containsPhrase) flagsHtml += '<span class="sd-flag red">EXACT PHRASE</span>';
+    if (muskAdj) flagsHtml += '<span class="sd-flag orange">MUSK-ADJACENT</span>';
+    if (isSeed) flagsHtml += '<span class="sd-flag purple">SEED ACCOUNT</span>';
+
+    // Format follower count
+    const fmtNum = n => n >= 1000 ? (n/1000).toFixed(1) + 'K' : n;
+    const followers = p.followers || 0;
+    const following = p.following || 0;
+
+    // Profile and post URLs
+    const handle = p.handle || 'unknown';
+    const profileUrl = `https://x.com/${handle}`;
+    const postUrl = p.url || profileUrl;
+
+    // Timestamp
+    const ts = p.timestamp ? new Date(p.timestamp) : null;
+    const timeStr = ts ? `${ts.getMonth()+1}/${ts.getDate()} ${ts.getHours()}:${String(ts.getMinutes()).padStart(2,'0')}` : '';
+
+    // Clickable header row
+    const row = document.createElement('div');
+    row.className = 'sim-row';
     row.innerHTML = `
-      <span class="sim-handle">@${s.handle}</span>
+      <span class="sim-arrow">&#9654;</span>
+      <span class="sim-handle">@${handle}</span>
       <div class="sim-bar-bg"><div class="sim-bar-fill" style="width:${pct}%;background:${color}"></div></div>
       <span class="sim-pct" style="color:${color}">${pct}%</span>
     `;
-    list.appendChild(row);
+
+    // Expandable detail
+    const detail = document.createElement('div');
+    detail.className = 'sim-detail';
+    detail.innerHTML = `
+      <div class="sd-name">${p.display_name || handle}</div>
+      <div class="sd-meta">${fmtNum(followers)} followers &middot; ${fmtNum(following)} following${p.joined ? ' &middot; Joined ' + p.joined : ''}${timeStr ? ' &middot; ' + timeStr : ''}</div>
+      <div class="sd-bio">${p.bio || 'No bio'}</div>
+      <div class="sd-text">${p.text_snippet || 'No text'}</div>
+      <div class="sd-links">
+        <a href="${profileUrl}" target="_blank">Profile &rarr;</a>
+        <a href="${postUrl}" target="_blank">Post &rarr;</a>
+      </div>
+      ${flagsHtml ? '<div class="sd-flags">' + flagsHtml + '</div>' : ''}
+    `;
+
+    // Toggle expand/collapse
+    row.onclick = (e) => {
+      e.stopPropagation();
+      const isOpen = detail.classList.contains('open');
+      // Close all others
+      list.querySelectorAll('.sim-detail.open').forEach(d => {
+        d.classList.remove('open');
+        d.previousElementSibling.querySelector('.sim-arrow').classList.remove('open');
+        d.previousElementSibling.classList.remove('expanded');
+      });
+      if (!isOpen) {
+        detail.classList.add('open');
+        row.querySelector('.sim-arrow').classList.add('open');
+        row.classList.add('expanded');
+        // Also fly camera to this node in the graph
+        if (graph) {
+          const nodes = graph.graphData().nodes;
+          const node = nodes.find(n => n.handle === handle);
+          if (node) {
+            showDetail(node);
+            graph.cameraPosition(
+              { x: node.x + 80, y: node.y + 40, z: node.z + 80 },
+              { x: node.x, y: node.y, z: node.z },
+              1000
+            );
+          }
+        }
+      }
+    };
+
+    entry.appendChild(row);
+    entry.appendChild(detail);
+    list.appendChild(entry);
   });
 }
 
