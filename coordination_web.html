@@ -254,13 +254,19 @@
 
 <!-- Load Panel -->
 <div id="load-panel">
-  <h2>Load Coordination Report</h2>
-  <p>Drop a coordination_report.json file from the detector, or load the demo.</p>
+  <h2>Coordination Web</h2>
+  <p>Detect coordinated inauthentic behavior on X/Twitter.<br>
+  Drop a <code style="color:#7c5cff">coordination_report.json</code> from the
+  <a href="https://github.com/Cosmolalia/Lysis-Unraveler" target="_blank" style="color:#5c9cff">Lysis Unraveler</a>
+  detector, or load the demo to see what a coordinated campaign looks like.</p>
   <div id="drop-zone" onclick="document.getElementById('file-input').click()">
     <p>Drop JSON here or click to browse</p>
     <input type="file" id="file-input" accept=".json">
   </div>
   <button class="demo-btn" onclick="loadDemo()">Load Demo Data</button>
+  <div style="margin-top:12px;font-size:9px;color:#444">
+    Your data stays in your browser. Nothing is uploaded anywhere.
+  </div>
 </div>
 
 <!-- Graph Container -->

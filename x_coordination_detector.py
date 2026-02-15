@@ -1174,20 +1174,64 @@ async def run_demo(script_dir):
 
 
 def open_visualization(script_dir, json_path, report=None):
-    """Create and open the 3D visualization."""
+    """Create and open the 3D visualization via local HTTP server."""
     viz_path = os.path.join(script_dir, "coordination_web.html")
+
+    # Always tell users about the hosted viz
+    json_abs = os.path.abspath(json_path)
+    info(f"Report saved → {json_abs}")
+    info(f"Online viz → https://akataleptos.com/coordination_web.html")
+    info(f"  (drag-drop your coordination_report.json onto that page)")
+
     if not os.path.exists(viz_path):
-        warn(f"coordination_web.html not found at {viz_path}")
-        info("Download it from github.com/Cosmolalia/Lysis-Unraveler")
+        # No local template — point to hosted version
+        import webbrowser
+        webbrowser.open("https://akataleptos.com/coordination_web.html")
         return
 
     auto_viz = json_path.replace(".json", "_viz.html")
     create_autoload_viz(viz_path, json_path, auto_viz)
     success(f"3D visualization → {auto_viz}")
 
+    # Serve via localhost to avoid browser file:// MIME blocking
+    serve_and_open(auto_viz)
+
+
+def serve_and_open(html_path):
+    """Start a local HTTP server and open the visualization in a browser."""
     import webbrowser
-    webbrowser.open(f"file://{os.path.abspath(auto_viz)}")
-    info("Opening in your browser...")
+    import http.server
+    import threading
+
+    abs_path = os.path.abspath(html_path)
+    serve_dir = os.path.dirname(abs_path)
+    filename = os.path.basename(abs_path)
+
+    # Find a free port
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('', 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(
+        *args, directory=serve_dir, **kwargs
+    )
+
+    server = http.server.HTTPServer(('127.0.0.1', port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    url = f"http://127.0.0.1:{port}/{filename}"
+    info(f"Serving at {url}")
+    info("Press Ctrl+C to stop the server when done viewing.")
+    webbrowser.open(url)
+
+    try:
+        thread.join()  # Keep alive until Ctrl+C
+    except KeyboardInterrupt:
+        server.shutdown()
+        info("Server stopped.")
 
 
 def create_autoload_viz(template_path, json_path, output_path):
