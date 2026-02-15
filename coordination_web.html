@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<!--
+  Coordination Web — 3D Interactive Visualization of Coordinated Inauthentic Behavior
+
+  Pair with x_coordination_detector.py:
+    python3 x_coordination_detector.py "phrase to search"
+    # Auto-opens this visualization with results
+
+  Or open standalone and drag-drop any coordination_report.json.
+  Or click "Load Demo" to see what a coordinated campaign looks like.
+
+  Dependencies: Three.js, 3d-force-graph, three-spritetext (loaded from CDN)
+  License: MIT — free to use, fork, extend. Sunlight is the best disinfectant.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Coordination Web — X Network Analysis</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    overflow: hidden;
+  }
+
+  /* ── Top bar ── */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0;
+    height: 48px;
+    background: rgba(10, 10, 20, 0.95);
+    border-bottom: 1px solid #1a1a2e;
+    display: flex; align-items: center; padding: 0 16px;
+    z-index: 100;
+    backdrop-filter: blur(10px);
+  }
+  #topbar h1 {
+    font-size: 14px; font-weight: 600; color: #7c5cff;
+    letter-spacing: 1px;
+  }
+  #topbar .stats {
+    margin-left: auto; font-size: 11px; color: #666;
+    display: flex; gap: 16px;
+  }
+  #topbar .stats span { color: #999; }
+
+  /* ── Coordination Meter ── */
+  #meter {
+    position: fixed; top: 60px; right: 16px;
+    width: 220px;
+    background: rgba(15, 15, 25, 0.95);
+    border: 1px solid #1a1a2e;
+    border-radius: 8px;
+    padding: 12px;
+    z-index: 90;
+  }
+  #meter h3 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  #meter .score-value { font-size: 32px; font-weight: 700; margin-bottom: 4px; }
+  #meter .verdict { font-size: 11px; font-weight: 600; margin-bottom: 8px; }
+  #meter .bar-bg { height: 6px; background: #1a1a2e; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
+  #meter .bar-fill { height: 100%; border-radius: 3px; transition: width 1s ease; }
+  #meter .reasons { font-size: 9px; color: #888; }
+  #meter .reasons li { margin-bottom: 3px; list-style: none; }
+  #meter .reasons li::before { content: "→ "; color: #7c5cff; }
+
+  /* ── Similarity Heatmap ── */
+  #similarity-panel {
+    position: fixed; top: 60px; left: 16px;
+    width: 240px;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+    background: rgba(15, 15, 25, 0.95);
+    border: 1px solid #1a1a2e;
+    border-radius: 8px;
+    padding: 12px;
+    z-index: 90;
+    display: none;
+  }
+  #similarity-panel h3 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .sim-row { display: flex; align-items: center; margin-bottom: 4px; font-size: 10px; cursor: pointer; }
+  .sim-row:hover { background: rgba(124, 92, 255, 0.1); }
+  .sim-bar-bg { flex: 1; height: 4px; background: #1a1a2e; border-radius: 2px; margin: 0 6px; }
+  .sim-bar-fill { height: 100%; border-radius: 2px; }
+  .sim-handle { width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #aaa; }
+  .sim-pct { width: 32px; text-align: right; color: #666; }
+
+  /* ── Timeline ── */
+  #timeline {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    height: 80px;
+    background: rgba(10, 10, 20, 0.95);
+    border-top: 1px solid #1a1a2e;
+    z-index: 90;
+    padding: 8px 16px;
+  }
+  #timeline h3 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  #timeline-canvas { width: 100%; height: 50px; }
+
+  /* ── Node detail panel ── */
+  #detail {
+    position: fixed; bottom: 92px; right: 16px;
+    width: 320px;
+    max-height: 400px;
+    overflow-y: auto;
+    background: rgba(15, 15, 25, 0.97);
+    border: 1px solid #2a2a4e;
+    border-radius: 8px;
+    padding: 16px;
+    z-index: 90;
+    display: none;
+  }
+  #detail .handle { font-size: 16px; font-weight: 700; color: #7c5cff; cursor: pointer; }
+  #detail .handle:hover { text-decoration: underline; }
+  #detail .meta { font-size: 10px; color: #666; margin: 4px 0; }
+  #detail .bio { font-size: 11px; color: #aaa; margin: 8px 0; padding: 6px; background: #111; border-radius: 4px; }
+  #detail .post-text { font-size: 11px; color: #ccc; margin: 8px 0; padding: 8px; background: #0f0f1a; border-left: 2px solid #7c5cff; border-radius: 2px; }
+  #detail .post-link { font-size: 10px; color: #5c9cff; cursor: pointer; }
+  #detail .post-link:hover { text-decoration: underline; }
+  #detail .close-btn { position: absolute; top: 8px; right: 12px; cursor: pointer; color: #444; font-size: 14px; }
+  #detail .close-btn:hover { color: #fff; }
+
+  /* ── Load panel ── */
+  #load-panel {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 500px;
+    background: rgba(15, 15, 25, 0.98);
+    border: 1px solid #2a2a4e;
+    border-radius: 12px;
+    padding: 32px;
+    z-index: 200;
+    text-align: center;
+  }
+  #load-panel h2 { font-size: 18px; color: #7c5cff; margin-bottom: 8px; }
+  #load-panel p { font-size: 12px; color: #888; margin-bottom: 20px; }
+  #drop-zone {
+    border: 2px dashed #2a2a4e;
+    border-radius: 8px;
+    padding: 40px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  #drop-zone:hover, #drop-zone.dragover { border-color: #7c5cff; }
+  #drop-zone p { font-size: 13px; color: #666; }
+  #file-input { display: none; }
+  .demo-btn {
+    margin-top: 16px; padding: 8px 20px;
+    background: #1a1a2e; border: 1px solid #2a2a4e; border-radius: 6px;
+    color: #7c5cff; cursor: pointer; font-family: inherit; font-size: 11px;
+  }
+  .demo-btn:hover { background: #2a2a4e; }
+
+  /* ── Graph container ── */
+  #graph {
+    width: 100vw;
+    height: calc(100vh - 48px - 80px);
+    margin-top: 48px;
+  }
+
+  /* ── Legend ── */
+  #legend {
+    position: fixed; bottom: 92px; left: 16px;
+    background: rgba(15, 15, 25, 0.95);
+    border: 1px solid #1a1a2e;
+    border-radius: 8px;
+    padding: 10px 14px;
+    z-index: 90;
+    font-size: 9px; color: #666;
+  }
+  .legend-row { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a2a4e; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<div id="topbar">
+  <h1>COORDINATION WEB</h1>
+  <div class="stats">
+    <div>Nodes: <span id="stat-nodes">0</span></div>
+    <div>Edges: <span id="stat-edges">0</span></div>
+    <div>Posts: <span id="stat-posts">0</span></div>
+    <div>Phrase match: <span id="stat-match">0%</span></div>
+  </div>
+</div>
+
+<!-- Coordination Meter -->
+<div id="meter">
+  <h3>Coordination Score</h3>
+  <div class="score-value" id="score-value">—</div>
+  <div class="verdict" id="score-verdict">Loading...</div>
+  <div class="bar-bg"><div class="bar-fill" id="score-bar" style="width:0%"></div></div>
+  <ul class="reasons" id="score-reasons"></ul>
+</div>
+
+<!-- Similarity Panel -->
+<div id="similarity-panel">
+  <h3>Post Similarity</h3>
+  <div id="sim-list"></div>
+</div>
+
+<!-- Timeline -->
+<div id="timeline">
+  <h3>Timeline</h3>
+  <canvas id="timeline-canvas"></canvas>
+</div>
+
+<!-- Node Detail -->
+<div id="detail">
+  <div class="close-btn" onclick="document.getElementById('detail').style.display='none'">&times;</div>
+  <div class="handle" id="det-handle"></div>
+  <div class="meta" id="det-meta"></div>
+  <div class="bio" id="det-bio"></div>
+  <div class="post-text" id="det-text"></div>
+  <div class="post-link" id="det-link"></div>
+</div>
+
+<!-- Legend -->
+<div id="legend" style="display:none">
+  <div class="legend-row"><div class="legend-dot" style="background:#ff3366"></div> High coordination signal</div>
+  <div class="legend-row"><div class="legend-dot" style="background:#ff9933"></div> Moderate signal</div>
+  <div class="legend-row"><div class="legend-dot" style="background:#33ccff"></div> Low signal / organic</div>
+  <div class="legend-row"><div class="legend-dot" style="background:#7c5cff"></div> Seed account</div>
+  <div style="margin-top: 6px; color: #444;">Node size = follower count</div>
+  <div style="color: #444;">Edge opacity = text similarity</div>
+</div>
+
+<!-- Load Panel -->
+<div id="load-panel">
+  <h2>Load Coordination Report</h2>
+  <p>Drop a coordination_report.json file from the detector, or load the demo.</p>
+  <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+    <p>Drop JSON here or click to browse</p>
+    <input type="file" id="file-input" accept=".json">
+  </div>
+  <button class="demo-btn" onclick="loadDemo()">Load Demo Data</button>
+</div>
+
+<!-- Graph Container -->
+<div id="graph"></div>
+
+<!-- Libraries -->
+<script src="https://unpkg.com/three@0.170.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three-spritetext@1.9.5/dist/three-spritetext.min.js"></script>
+<script src="https://unpkg.com/3d-force-graph@1.77.3/dist/3d-force-graph.min.js"></script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════
+// COORDINATION WEB — 3D Interactive Visualization
+// ═══════════════════════════════════════════════════════════════════════
+
+let graph = null;
+let reportData = null;
+
+// ── File Loading ──────────────────────────────────────────────────────
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('dragover');
+});
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file) readFile(file);
+});
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files[0]) readFile(e.target.files[0]);
+});
+
+function readFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      loadReport(data);
+    } catch (err) {
+      alert('Failed to parse JSON: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ── Demo Data ─────────────────────────────────────────────────────────
+
+function loadDemo() {
+  // Simulated coordination report for demo
+  const now = new Date();
+  const demo = {
+    query: "Amanda Askell has no children",
+    collection_time: now.toISOString(),
+    total_posts: 18,
+    unique_authors: 14,
+    text_analysis: {
+      total_texts: 18,
+      exact_duplicates: 3,
+      exact_duplicate_posts: 9,
+      near_duplicate_pairs: 12,
+      exact_phrase_matches: 15,
+      phrase_match_rate: 0.833,
+      uniqueness_ratio: 0.39,
+      most_common_texts: [
+        ["amanda askell has no children and is teaching claude bizarre things", 6],
+        ["amanda askell has no children. why is she deciding ai morals?", 3],
+        ["this childless woman is teaching claude right from wrong. let that sink in.", 2],
+      ]
+    },
+    temporal_analysis: {
+      count: 18,
+      first_post: new Date(now - 36*3600000).toISOString(),
+      last_post: now.toISOString(),
+      span_hours: 36,
+      mean_interval_seconds: 7200,
+      densest_hour: new Date(now - 4*3600000).toISOString().slice(0,13) + ":00",
+      densest_hour_count: 7,
+      poisson_p_value: 0.0003,
+      verdict: "EXTREME CLUSTERING",
+      hourly_distribution: {}
+    },
+    account_analysis: {
+      total_profiles: 14,
+      profiles_with_data: 14,
+      follower_distribution: { small_under_1k: 5, medium_1k_10k: 6, large_10k_plus: 3 },
+      follower_stats: { min: 127, max: 123000, median: 3400, mean: 15200 },
+      ratio_stats: { mean: 12.5, suspicious_ratio_count: 4 },
+    },
+    bio_analysis: {
+      total_bios: 14,
+      shared_keywords: { tesla: 8, musk: 7, elon: 6, freedom: 5, patriot: 4, mother: 4, parent: 3, conservative: 3 },
+      network_signals: { musk_adjacent: 9, political_keywords: 6, ai_keywords: 2, musk_adjacent_pct: 64.3 }
+    },
+    coordination_score: {
+      score: 0.82,
+      verdict: "HIGHLY LIKELY COORDINATED",
+      component_scores: { text_similarity: 0.91, temporal_clustering: 0.88, network_homogeneity: 0.64, account_anomalies: 0.29 },
+      reasons: [
+        "83% of posts contain the exact target phrase",
+        "Only 39% unique texts (high duplication)",
+        "Temporal clustering p=0.0003 (highly non-random)",
+        "64% of accounts are Musk-adjacent",
+      ]
+    },
+    posts: [
+      { handle: "gailalfaratx", display_name: "Gail Alfar", text_snippet: "Why Amanda Askell, the 37-year-old philosopher at Anthropic who's leading efforts to instill \"good character\" into their AI, Claude, is the wrong choice!", timestamp: new Date(now - 36*3600000).toISOString(), followers: 123000, following: 599, bio: "Writer. Support Elon Musk and Tesla. Austin, Texas.", joined: "Jan 2020", likes: 847, reposts: 312, url: "https://x.com/gailalfaratx/status/2022798159429120297" },
+      { handle: "tesla_mom_tx", display_name: "Tesla Mom TX", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. As a mother I find this deeply concerning.", timestamp: new Date(now - 28*3600000).toISOString(), followers: 4200, following: 890, bio: "Tesla Model Y owner. Mother of 3. Texas forever. Elon supporter.", joined: "Mar 2021", likes: 124, reposts: 67, url: "https://x.com/tesla_mom_tx/status/example1" },
+      { handle: "patriot_ai_watch", display_name: "AI Watchdog", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. Who approved this??", timestamp: new Date(now - 26*3600000).toISOString(), followers: 890, following: 2100, bio: "Watching Big Tech. MAGA. God first. Fighting for our kids' future.", joined: "Nov 2022", likes: 89, reposts: 45, url: "https://x.com/patriot_ai_watch/status/example2" },
+      { handle: "freedom_eagle_us", display_name: "Freedom Eagle", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things", timestamp: new Date(now - 24*3600000).toISOString(), followers: 340, following: 1800, bio: "Patriot. Conservative. Support Elon Musk. USA first.", joined: "Aug 2023", likes: 23, reposts: 12, url: "https://x.com/freedom_eagle_us/status/example3" },
+      { handle: "real_talk_sarah", display_name: "Sarah J", text_snippet: "Amanda Askell has no children. Why is she deciding AI morals? This is insane.", timestamp: new Date(now - 22*3600000).toISOString(), followers: 1200, following: 450, bio: "Mom. Wife. Tesla fan. Speaking truth.", joined: "Feb 2022", likes: 156, reposts: 78, url: "https://x.com/real_talk_sarah/status/example4" },
+      { handle: "musk_world_news", display_name: "Musk World News", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. Meanwhile Grok is built by parents who understand responsibility.", timestamp: new Date(now - 20*3600000).toISOString(), followers: 28000, following: 340, bio: "Latest news about Elon Musk, Tesla, SpaceX, and xAI.", joined: "Jan 2023", likes: 534, reposts: 267, url: "https://x.com/musk_world_news/status/example5" },
+      { handle: "concerned_dad_07", display_name: "Concerned Dad", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. Let that sink in.", timestamp: new Date(now - 18*3600000).toISOString(), followers: 127, following: 890, bio: "Father of 4. Christian conservative. Anti-woke.", joined: "Sep 2023", likes: 34, reposts: 19, url: "https://x.com/concerned_dad_07/status/example6" },
+      { handle: "techtruth2024", display_name: "Tech Truth", text_snippet: "This childless woman is teaching Claude right from wrong. Let that sink in.", timestamp: new Date(now - 16*3600000).toISOString(), followers: 5600, following: 1200, bio: "Tech news without the spin. Tesla investor. Free speech.", joined: "May 2022", likes: 201, reposts: 95, url: "https://x.com/techtruth2024/status/example7" },
+      { handle: "mama_bear_usa", display_name: "Mama Bear", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. A real mother would never approve this.", timestamp: new Date(now - 12*3600000).toISOString(), followers: 2100, following: 670, bio: "Protecting our kids from Big Tech. Mother of 5. MAGA.", joined: "Oct 2022", likes: 178, reposts: 89, url: "https://x.com/mama_bear_usa/status/example8" },
+      { handle: "evfuture_now", display_name: "EV Future", text_snippet: "Amanda Askell has no children. She compares training Claude to 'raising a child.' The hubris.", timestamp: new Date(now - 10*3600000).toISOString(), followers: 8900, following: 420, bio: "Electric vehicle advocate. Tesla since 2019. SpaceX fan.", joined: "Jul 2021", likes: 312, reposts: 145, url: "https://x.com/evfuture_now/status/example9" },
+      { handle: "ai_ethics_real", display_name: "Real AI Ethics", text_snippet: "I have serious concerns about Amanda Askell's approach to Claude's personality. Interesting thread from @gailalfaratx", timestamp: new Date(now - 8*3600000).toISOString(), followers: 3400, following: 1500, bio: "AI ethics researcher (independent). Skeptical of corporate alignment.", joined: "Apr 2023", likes: 67, reposts: 23, url: "https://x.com/ai_ethics_real/status/example10" },
+      { handle: "liberty_lens_us", display_name: "Liberty Lens", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. We need parents making these decisions, not childless philosophers.", timestamp: new Date(now - 6*3600000).toISOString(), followers: 670, following: 2300, bio: "Conservative. Freedom. 2A. Elon fan. Fighting the woke machine.", joined: "Dec 2023", likes: 45, reposts: 22, url: "https://x.com/liberty_lens_us/status/example11" },
+      { handle: "teslafan_mike", display_name: "Mike T", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things", timestamp: new Date(now - 5*3600000).toISOString(), followers: 1800, following: 560, bio: "Tesla Model 3 owner. Austin TX. Support Elon.", joined: "Jun 2021", likes: 56, reposts: 28, url: "https://x.com/teslafan_mike/status/example12" },
+      { handle: "wake_up_america_x", display_name: "Wake Up America", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. The elites want AI to parent YOUR children.", timestamp: new Date(now - 4*3600000).toISOString(), followers: 15000, following: 280, bio: "Truth. Freedom. God. Country. Fighting globalism.", joined: "Mar 2022", likes: 423, reposts: 198, url: "https://x.com/wake_up_america_x/status/example13" },
+      { handle: "spacex_daily_", display_name: "SpaceX Daily", text_snippet: "Amanda Askell has no children. Who at Anthropic thought this was a good idea for someone designing AI morality?", timestamp: new Date(now - 3*3600000).toISOString(), followers: 34000, following: 150, bio: "Daily SpaceX news. Also covering Tesla and xAI. Not affiliated with SpaceX.", joined: "Aug 2020", likes: 267, reposts: 134, url: "https://x.com/spacex_daily_/status/example14" },
+      { handle: "claude_skeptic", display_name: "Claude Skeptic", text_snippet: "Amanda Askell has no children and is teaching Claude bizarre things. Switch to Grok — built by people who get it.", timestamp: new Date(now - 2*3600000).toISOString(), followers: 450, following: 3200, bio: "Former Claude user. Now Grok. Elon knows AI.", joined: "Jan 2024", likes: 89, reposts: 45, url: "https://x.com/claude_skeptic/status/example15" },
+      { handle: "traditional_val", display_name: "Traditional Values", text_snippet: "This childless woman is teaching Claude right from wrong. Let that sink in. Thread by @gailalfaratx is a must-read.", timestamp: new Date(now - 1.5*3600000).toISOString(), followers: 7800, following: 890, bio: "Faith. Family. Freedom. Conservative values in a liberal world.", joined: "Nov 2021", likes: 345, reposts: 167, url: "https://x.com/traditional_val/status/example16" },
+      { handle: "organic_critic", display_name: "Thoughtful AI Critic", text_snippet: "I disagree with some of Askell's approaches to Claude's constitution, particularly around moral relativism in edge cases. Worth reading the actual document though.", timestamp: new Date(now - 0.5*3600000).toISOString(), followers: 12000, following: 800, bio: "AI safety researcher. PhD. Opinions are my own. Previously at DeepMind.", joined: "Mar 2019", likes: 234, reposts: 12, url: "https://x.com/organic_critic/status/example17" },
+    ]
+  };
+  loadReport(demo);
+}
+
+// ── Build Graph ───────────────────────────────────────────────────────
+
+function loadReport(data) {
+  reportData = data;
+  document.getElementById('load-panel').style.display = 'none';
+  document.getElementById('legend').style.display = 'block';
+  document.getElementById('similarity-panel').style.display = 'block';
+
+  // Build graph data
+  const { nodes, links } = buildGraphData(data);
+
+  // Update stats
+  document.getElementById('stat-nodes').textContent = nodes.length;
+  document.getElementById('stat-edges').textContent = links.length;
+  document.getElementById('stat-posts').textContent = data.total_posts || data.posts?.length || 0;
+  const matchRate = data.text_analysis?.phrase_match_rate;
+  document.getElementById('stat-match').textContent = matchRate ? (matchRate * 100).toFixed(0) + '%' : '—';
+
+  // Update meter
+  updateMeter(data.coordination_score);
+
+  // Build similarity panel
+  buildSimilarityPanel(data.posts);
+
+  // Build timeline
+  buildTimeline(data.posts);
+
+  // Render 3D graph
+  renderGraph(nodes, links);
+}
+
+function buildGraphData(data) {
+  const posts = data.posts || [];
+  const nodes = [];
+  const links = [];
+  const query = (data.query || '').toLowerCase();
+
+  // Detect seed account (highest followers, first post)
+  let seedHandle = '';
+  if (posts.length > 0) {
+    const sorted = [...posts].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    seedHandle = sorted[0]?.handle || '';
+  }
+
+  // Create nodes
+  posts.forEach((p, i) => {
+    const text = (p.text_snippet || '').toLowerCase();
+    const containsPhrase = text.includes(query);
+    const isSeed = p.handle === seedHandle;
+
+    // Coordination signal: exact phrase match + Musk-adjacent bio
+    const bio = (p.bio || '').toLowerCase();
+    const muskAdjacent = ['elon', 'musk', 'tesla', 'spacex', 'grok'].some(k => bio.includes(k));
+    const politicalKeywords = ['maga', 'patriot', 'conservative', 'freedom', 'god', 'faith'].some(k => bio.includes(k));
+
+    let signal = 0;
+    if (containsPhrase) signal += 0.4;
+    if (muskAdjacent) signal += 0.3;
+    if (politicalKeywords) signal += 0.15;
+    // Suspicious follower ratio
+    if (p.followers && p.following) {
+      const ratio = p.followers / p.following;
+      if (ratio < 0.1 || ratio > 200) signal += 0.15;
+    }
+
+    const followers = p.followers || 100;
+    const nodeSize = Math.max(3, Math.log10(followers + 1) * 4);
+
+    nodes.push({
+      id: p.handle + '_' + i,
+      handle: p.handle,
+      name: p.display_name || p.handle,
+      text: p.text_snippet || '',
+      timestamp: p.timestamp,
+      followers: followers,
+      following: p.following,
+      bio: p.bio || '',
+      joined: p.joined || '',
+      likes: p.likes || 0,
+      reposts: p.reposts || 0,
+      url: p.url || `https://x.com/${p.handle}`,
+      profileUrl: `https://x.com/${p.handle}`,
+      signal: signal,
+      isSeed: isSeed,
+      muskAdjacent: muskAdjacent,
+      containsPhrase: containsPhrase,
+      size: nodeSize,
+      color: isSeed ? '#7c5cff' :
+             signal > 0.6 ? '#ff3366' :
+             signal > 0.3 ? '#ff9933' : '#33ccff',
+    });
+  });
+
+  // Create links based on text similarity
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const sim = textSimilarity(nodes[i].text, nodes[j].text);
+      if (sim > 0.3) {
+        links.push({
+          source: nodes[i].id,
+          target: nodes[j].id,
+          similarity: sim,
+          color: `rgba(124, 92, 255, ${sim * 0.6})`,
+          width: sim * 3,
+        });
+      }
+    }
+  }
+
+  // Also link accounts that reference the seed
+  const seedNode = nodes.find(n => n.isSeed);
+  if (seedNode) {
+    nodes.forEach(n => {
+      if (!n.isSeed && n.text.toLowerCase().includes(seedNode.handle.toLowerCase())) {
+        const exists = links.find(l =>
+          (l.source === seedNode.id && l.target === n.id) ||
+          (l.source === n.id && l.target === seedNode.id)
+        );
+        if (!exists) {
+          links.push({
+            source: seedNode.id,
+            target: n.id,
+            similarity: 0.5,
+            color: 'rgba(255, 51, 102, 0.4)',
+            width: 2,
+            isReference: true,
+          });
+        }
+      }
+    });
+  }
+
+  return { nodes, links };
+}
+
+function textSimilarity(a, b) {
+  a = a.toLowerCase().trim();
+  b = b.toLowerCase().trim();
+  if (a === b) return 1.0;
+
+  // Jaccard on word sets
+  const setA = new Set(a.split(/\s+/));
+  const setB = new Set(b.split(/\s+/));
+  const intersection = new Set([...setA].filter(x => setB.has(x)));
+  const union = new Set([...setA, ...setB]);
+  return intersection.size / union.size;
+}
+
+// ── Render 3D Graph ───────────────────────────────────────────────────
+
+function renderGraph(nodes, links) {
+  const container = document.getElementById('graph');
+
+  // Sort nodes by timestamp for Z-axis positioning
+  const timestamps = nodes.map(n => new Date(n.timestamp).getTime()).filter(t => !isNaN(t));
+  const minT = Math.min(...timestamps);
+  const maxT = Math.max(...timestamps);
+  const tRange = maxT - minT || 1;
+
+  // Assign initial Z positions based on chronology
+  nodes.forEach(n => {
+    const t = new Date(n.timestamp).getTime();
+    if (!isNaN(t)) {
+      n.fz = ((t - minT) / tRange - 0.5) * 300; // Spread along Z
+    }
+  });
+
+  graph = ForceGraph3D()(container)
+    .graphData({ nodes, links })
+    .backgroundColor('#0a0a0f')
+    .nodeVal(n => n.size * n.size)
+    .nodeColor(n => n.color)
+    .nodeOpacity(0.9)
+    .nodeLabel(n => '')  // We'll use click instead
+    .linkWidth(l => l.width || 1)
+    .linkColor(l => l.color || 'rgba(124, 92, 255, 0.2)')
+    .linkOpacity(0.6)
+    .linkDirectionalParticles(l => l.similarity > 0.7 ? 2 : 0)
+    .linkDirectionalParticleWidth(1.5)
+    .linkDirectionalParticleColor(() => '#7c5cff')
+    .onNodeClick(node => showDetail(node))
+    .onNodeHover(node => {
+      container.style.cursor = node ? 'pointer' : 'default';
+    })
+    .d3AlphaDecay(0.02)
+    .d3VelocityDecay(0.3)
+    .warmupTicks(50);
+
+  // Add node labels as sprites
+  graph.nodeThreeObject(node => {
+    const sprite = new SpriteText(`@${node.handle}`);
+    sprite.color = node.isSeed ? '#7c5cff' : '#666';
+    sprite.textHeight = node.isSeed ? 4 : 2.5;
+    sprite.fontFace = 'SF Mono, Consolas, monospace';
+    sprite.backgroundColor = 'rgba(10, 10, 20, 0.7)';
+    sprite.padding = 1;
+    sprite.borderRadius = 2;
+    return sprite;
+  });
+
+  graph.nodeThreeObjectExtend(true);
+
+  // Camera position
+  setTimeout(() => {
+    graph.cameraPosition({ x: 200, y: 100, z: 300 });
+  }, 500);
+}
+
+// ── Detail Panel ──────────────────────────────────────────────────────
+
+function showDetail(node) {
+  const detail = document.getElementById('detail');
+  detail.style.display = 'block';
+
+  document.getElementById('det-handle').textContent = `@${node.handle}`;
+  document.getElementById('det-handle').onclick = () => window.open(node.profileUrl, '_blank');
+
+  const meta = [];
+  if (node.followers) meta.push(`${node.followers.toLocaleString()} followers`);
+  if (node.following) meta.push(`${node.following.toLocaleString()} following`);
+  if (node.joined) meta.push(`Joined ${node.joined}`);
+  if (node.likes) meta.push(`${node.likes} likes`);
+  if (node.reposts) meta.push(`${node.reposts} reposts`);
+  document.getElementById('det-meta').textContent = meta.join(' · ');
+
+  document.getElementById('det-bio').textContent = node.bio || 'No bio';
+  document.getElementById('det-text').textContent = node.text || 'No text';
+
+  const linkEl = document.getElementById('det-link');
+  linkEl.textContent = 'Open post →';
+  linkEl.onclick = () => window.open(node.url, '_blank');
+
+  // Highlight signal indicators
+  const signals = [];
+  if (node.containsPhrase) signals.push('EXACT PHRASE MATCH');
+  if (node.muskAdjacent) signals.push('MUSK-ADJACENT');
+  if (node.isSeed) signals.push('SEED ACCOUNT');
+
+  if (signals.length > 0) {
+    document.getElementById('det-meta').textContent += '\n⚠ ' + signals.join(' · ');
+  }
+
+  // Pulse the node
+  if (graph) {
+    graph.nodeColor(n => {
+      if (n.id === node.id) return '#ffffff';
+      return n.color;
+    });
+    setTimeout(() => {
+      graph.nodeColor(n => n.color);
+    }, 800);
+  }
+}
+
+// ── Coordination Meter ────────────────────────────────────────────────
+
+function updateMeter(scoreData) {
+  if (!scoreData) return;
+
+  const score = scoreData.score || 0;
+  const pct = (score * 100).toFixed(0);
+
+  document.getElementById('score-value').textContent = pct + '%';
+  document.getElementById('score-value').style.color =
+    score > 0.7 ? '#ff3366' : score > 0.5 ? '#ff9933' : '#33ccff';
+
+  document.getElementById('score-verdict').textContent = scoreData.verdict || 'UNKNOWN';
+  document.getElementById('score-verdict').style.color =
+    score > 0.7 ? '#ff3366' : score > 0.5 ? '#ff9933' : '#33ccff';
+
+  const bar = document.getElementById('score-bar');
+  bar.style.width = pct + '%';
+  bar.style.background = score > 0.7 ? '#ff3366' : score > 0.5 ? '#ff9933' : '#33ccff';
+
+  const reasons = document.getElementById('score-reasons');
+  reasons.innerHTML = '';
+  (scoreData.reasons || []).forEach(r => {
+    const li = document.createElement('li');
+    li.textContent = r;
+    reasons.appendChild(li);
+  });
+}
+
+// ── Similarity Panel ──────────────────────────────────────────────────
+
+function buildSimilarityPanel(posts) {
+  if (!posts || posts.length === 0) return;
+
+  const list = document.getElementById('sim-list');
+  list.innerHTML = '';
+
+  // Calculate each post's max similarity to any other post
+  const sims = posts.map((p, i) => {
+    let maxSim = 0;
+    posts.forEach((q, j) => {
+      if (i !== j) {
+        const s = textSimilarity(p.text_snippet || '', q.text_snippet || '');
+        if (s > maxSim) maxSim = s;
+      }
+    });
+    return { handle: p.handle, sim: maxSim, index: i };
+  });
+
+  // Sort by similarity descending
+  sims.sort((a, b) => b.sim - a.sim);
+
+  sims.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'sim-row';
+    row.onclick = () => {
+      // Find and click the node
+      const nodes = graph.graphData().nodes;
+      const node = nodes.find(n => n.handle === s.handle);
+      if (node) {
+        showDetail(node);
+        graph.cameraPosition(
+          { x: node.x + 80, y: node.y + 40, z: node.z + 80 },
+          { x: node.x, y: node.y, z: node.z },
+          1000
+        );
+      }
+    };
+
+    const pct = (s.sim * 100).toFixed(0);
+    const color = s.sim > 0.7 ? '#ff3366' : s.sim > 0.4 ? '#ff9933' : '#33ccff';
+
+    row.innerHTML = `
+      <span class="sim-handle">@${s.handle}</span>
+      <div class="sim-bar-bg"><div class="sim-bar-fill" style="width:${pct}%;background:${color}"></div></div>
+      <span class="sim-pct" style="color:${color}">${pct}%</span>
+    `;
+    list.appendChild(row);
+  });
+}
+
+// ── Timeline ──────────────────────────────────────────────────────────
+
+function buildTimeline(posts) {
+  if (!posts || posts.length === 0) return;
+
+  const canvas = document.getElementById('timeline-canvas');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width;
+  canvas.height = 50;
+  const ctx = canvas.getContext('2d');
+
+  // Parse timestamps
+  const items = posts
+    .map(p => ({
+      time: new Date(p.timestamp).getTime(),
+      handle: p.handle,
+      signal: 0,
+      followers: p.followers || 100,
+    }))
+    .filter(i => !isNaN(i.time))
+    .sort((a, b) => a.time - b.time);
+
+  if (items.length === 0) return;
+
+  const minT = items[0].time;
+  const maxT = items[items.length - 1].time;
+  const range = maxT - minT || 1;
+  const pad = 40;
+  const w = canvas.width - pad * 2;
+
+  // Draw axis
+  ctx.strokeStyle = '#1a1a2e';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad, 30);
+  ctx.lineTo(pad + w, 30);
+  ctx.stroke();
+
+  // Draw posts as dots
+  items.forEach((item, i) => {
+    const x = pad + ((item.time - minT) / range) * w;
+    const r = Math.max(2, Math.log10(item.followers + 1) * 1.5);
+
+    // Check if clustered (within 1 hour of neighbors)
+    let clustered = false;
+    items.forEach((other, j) => {
+      if (i !== j && Math.abs(item.time - other.time) < 3600000) clustered = true;
+    });
+
+    ctx.fillStyle = clustered ? '#ff3366' : '#33ccff';
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.arc(x, 25, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Label for first and last
+    if (i === 0 || i === items.length - 1) {
+      ctx.fillStyle = '#666';
+      ctx.font = '9px monospace';
+      ctx.globalAlpha = 1;
+      const date = new Date(item.time);
+      const label = `${date.getMonth()+1}/${date.getDate()} ${date.getHours()}:${String(date.getMinutes()).padStart(2,'0')}`;
+      ctx.fillText(label, x - 20, 45);
+    }
+  });
+
+  ctx.globalAlpha = 1;
+
+  // Density highlight — find the densest hour
+  const hourBuckets = {};
+  items.forEach(item => {
+    const hourKey = Math.floor(item.time / 3600000);
+    if (!hourBuckets[hourKey]) hourBuckets[hourKey] = [];
+    hourBuckets[hourKey].push(item);
+  });
+
+  let maxBucket = 0;
+  let maxBucketKey = 0;
+  Object.entries(hourBuckets).forEach(([key, bucket]) => {
+    if (bucket.length > maxBucket) {
+      maxBucket = bucket.length;
+      maxBucketKey = parseInt(key);
+    }
+  });
+
+  if (maxBucket >= 3) {
+    const x1 = pad + ((maxBucketKey * 3600000 - minT) / range) * w;
+    const x2 = pad + (((maxBucketKey + 1) * 3600000 - minT) / range) * w;
+    ctx.fillStyle = 'rgba(255, 51, 102, 0.1)';
+    ctx.fillRect(x1, 0, x2 - x1, 50);
+    ctx.fillStyle = '#ff3366';
+    ctx.font = '8px monospace';
+    ctx.fillText(`${maxBucket} posts/hr`, x1, 10);
+  }
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    document.getElementById('detail').style.display = 'none';
+  }
+  if (e.key === 'r' || e.key === 'R') {
+    // Reset camera
+    if (graph) graph.cameraPosition({ x: 200, y: 100, z: 300 }, { x: 0, y: 0, z: 0 }, 1000);
+  }
+});
+
+// ── Window resize ─────────────────────────────────────────────────────
+
+window.addEventListener('resize', () => {
+  if (graph) {
+    graph.width(window.innerWidth);
+    graph.height(window.innerHeight - 48 - 80);
+  }
+  if (reportData) buildTimeline(reportData.posts);
+});
+</script>
+
+</body>
+</html>
