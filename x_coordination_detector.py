@@ -50,14 +50,29 @@ from difflib import SequenceMatcher
 
 async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None):
     """Search X for query, collect all matching posts with metadata."""
+    import shutil
     from playwright.async_api import async_playwright
 
     posts = []
     seen_ids = set()
 
+    # Find a usable browser — prefer system Chromium over Playwright's headless shell
+    system_chromium = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+
     async with async_playwright() as p:
-        # Launch browser (visible so user can log in)
-        browser = await p.chromium.launch(headless=headless)
+        # Launch browser — use system Chromium so we get a VISIBLE window for login
+        launch_opts = {"headless": headless}
+        if not headless and system_chromium:
+            launch_opts["executable_path"] = system_chromium
+            print(f"  [browser] Using system browser: {system_chromium}")
+
+        try:
+            browser = await p.chromium.launch(**launch_opts)
+        except Exception as e:
+            # Fallback: try Playwright's bundled browser
+            print(f"  [browser] System browser failed ({e}), trying Playwright's...")
+            browser = await p.chromium.launch(headless=headless)
+
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -65,10 +80,13 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
 
         # Load cookies if available
         if cookie_file and os.path.exists(cookie_file):
-            with open(cookie_file) as f:
-                cookies = json.load(f)
-            await context.add_cookies(cookies)
-            print(f"  [cookies] Loaded from {cookie_file}")
+            try:
+                with open(cookie_file) as f:
+                    cookies = json.load(f)
+                await context.add_cookies(cookies)
+                print(f"  [cookies] Loaded from {cookie_file}")
+            except Exception:
+                print(f"  [cookies] Could not load {cookie_file}, starting fresh")
 
         page = await context.new_page()
 
@@ -80,7 +98,6 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
         # Check if logged in
         logged_in = False
         try:
-            # Look for search box or compose button (signs of logged-in state)
             search = await page.query_selector('a[href="/explore"]')
             if search:
                 logged_in = True
@@ -88,19 +105,34 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
             pass
 
         if not logged_in:
-            print("\n" + "=" * 60)
-            print("  LOG IN TO X in the browser window.")
-            print("  Then come back here and press ENTER.")
-            print("=" * 60)
-            input("\n  Press ENTER when logged in > ")
-            await page.wait_for_timeout(2000)
+            print(f"\n{C.YELLOW}{'=' * 60}")
+            print(f"  LOG IN TO X in the browser window.")
+            print(f"  Take your time — the browser will stay open.")
+            print(f"  When you're logged in, come back here and press ENTER.")
+            print(f"{'=' * 60}{C.RESET}")
+
+            # Use asyncio-safe input so we don't block the event loop
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, input, "\n  Press ENTER when logged in > ")
+
+            # Give the page a moment to settle
+            try:
+                await page.wait_for_timeout(2000)
+            except Exception:
+                # Page might have navigated during login — reload
+                await page.goto("https://x.com", wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
 
             # Save cookies for next time
             if cookie_file:
-                cookies = await context.cookies()
-                with open(cookie_file, "w") as f:
-                    json.dump(cookies, f)
-                print(f"  [cookies] Saved to {cookie_file}")
+                try:
+                    cookies = await context.cookies()
+                    os.makedirs(os.path.dirname(cookie_file) if os.path.dirname(cookie_file) else ".", exist_ok=True)
+                    with open(cookie_file, "w") as f:
+                        json.dump(cookies, f)
+                    print(f"  [cookies] Saved to {cookie_file}")
+                except Exception:
+                    pass
 
         # Search for the query
         encoded = query.replace(" ", "%20")
