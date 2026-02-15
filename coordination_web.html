@@ -132,13 +132,24 @@
     z-index: 90;
     display: none;
   }
-  #detail .handle { font-size: 16px; font-weight: 700; color: #7c5cff; cursor: pointer; }
+  #detail .det-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  #detail .det-avatar { width: 48px; height: 48px; border-radius: 50%; border: 2px solid #7c5cff; object-fit: cover; background: #1a1a2e; }
+  #detail .det-name-block { flex: 1; }
+  #detail .handle { font-size: 15px; font-weight: 700; color: #7c5cff; cursor: pointer; }
   #detail .handle:hover { text-decoration: underline; }
+  #detail .display-name { font-size: 12px; color: #ccc; font-weight: 600; }
   #detail .meta { font-size: 10px; color: #666; margin: 4px 0; }
   #detail .bio { font-size: 11px; color: #aaa; margin: 8px 0; padding: 6px; background: #111; border-radius: 4px; }
-  #detail .post-text { font-size: 11px; color: #ccc; margin: 8px 0; padding: 8px; background: #0f0f1a; border-left: 2px solid #7c5cff; border-radius: 2px; }
-  #detail .post-link { font-size: 10px; color: #5c9cff; cursor: pointer; }
-  #detail .post-link:hover { text-decoration: underline; }
+  #detail .post-text { font-size: 11px; color: #ccc; margin: 8px 0; padding: 8px; background: #0f0f1a; border-left: 2px solid #7c5cff; border-radius: 2px; line-height: 1.5; }
+  #detail .det-links { display: flex; gap: 10px; margin: 8px 0; }
+  #detail .det-links a { font-size: 10px; color: #5c9cff; text-decoration: none; padding: 3px 8px; border: 1px solid #2a2a4e; border-radius: 4px; }
+  #detail .det-links a:hover { background: #1a1a2e; text-decoration: none; }
+  #detail .det-flags { margin: 6px 0; }
+  #detail .det-flag { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 9px; font-weight: 600; margin-right: 4px; }
+  .det-flag.red { background: rgba(255, 51, 102, 0.2); color: #ff3366; }
+  .det-flag.orange { background: rgba(255, 153, 51, 0.2); color: #ff9933; }
+  .det-flag.purple { background: rgba(124, 92, 255, 0.2); color: #7c5cff; }
+  .det-flag.blue { background: rgba(51, 204, 255, 0.2); color: #33ccff; }
   #detail .close-btn { position: absolute; top: 8px; right: 12px; cursor: pointer; color: #444; font-size: 14px; }
   #detail .close-btn:hover { color: #fff; }
 
@@ -235,11 +246,18 @@
 <!-- Node Detail -->
 <div id="detail">
   <div class="close-btn" onclick="document.getElementById('detail').style.display='none'">&times;</div>
-  <div class="handle" id="det-handle"></div>
+  <div class="det-header">
+    <img id="det-avatar" class="det-avatar" src="" alt="">
+    <div class="det-name-block">
+      <div class="display-name" id="det-displayname"></div>
+      <div class="handle" id="det-handle"></div>
+    </div>
+  </div>
+  <div class="det-flags" id="det-flags"></div>
   <div class="meta" id="det-meta"></div>
   <div class="bio" id="det-bio"></div>
   <div class="post-text" id="det-text"></div>
-  <div class="post-link" id="det-link"></div>
+  <div class="det-links" id="det-links"></div>
 </div>
 
 <!-- Legend -->
@@ -589,19 +607,115 @@ function renderGraph(nodes, links) {
     .d3VelocityDecay(0.3)
     .warmupTicks(50);
 
-  // Add node labels as sprites
+  // Profile pic texture cache
+  const avatarCache = {};
+  const textureLoader = new THREE.TextureLoader();
+  textureLoader.crossOrigin = 'anonymous';
+
+  function makeAvatarSprite(handle, size, borderColor) {
+    const group = new THREE.Group();
+
+    // Circular avatar via canvas
+    const res = 128;
+    const canvas = document.createElement('canvas');
+    canvas.width = res;
+    canvas.height = res;
+    const ctx = canvas.getContext('2d');
+
+    // Draw colored border ring
+    ctx.beginPath();
+    ctx.arc(res/2, res/2, res/2 - 1, 0, Math.PI * 2);
+    ctx.fillStyle = borderColor;
+    ctx.fill();
+
+    // Inner circle (dark bg as placeholder)
+    ctx.beginPath();
+    ctx.arc(res/2, res/2, res/2 - 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fill();
+
+    // Initial letter as placeholder
+    ctx.fillStyle = '#666';
+    ctx.font = 'bold 48px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(handle[0].toUpperCase(), res/2, res/2);
+
+    const canvasTexture = new THREE.CanvasTexture(canvas);
+    const spriteMat = new THREE.SpriteMaterial({ map: canvasTexture, transparent: true });
+    const avatarSprite = new THREE.Sprite(spriteMat);
+    avatarSprite.scale.set(size, size, 1);
+    group.add(avatarSprite);
+
+    // Load actual profile pic async
+    const imgUrl = `https://unavatar.io/x/${handle}`;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      // Redraw canvas with the actual image clipped to circle
+      ctx.clearRect(0, 0, res, res);
+
+      // Border ring
+      ctx.beginPath();
+      ctx.arc(res/2, res/2, res/2 - 1, 0, Math.PI * 2);
+      ctx.fillStyle = borderColor;
+      ctx.fill();
+
+      // Clip to inner circle and draw image
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(res/2, res/2, res/2 - 4, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.drawImage(img, 2, 2, res - 4, res - 4);
+      ctx.restore();
+
+      canvasTexture.needsUpdate = true;
+    };
+    img.onerror = () => {}; // Keep the placeholder
+    img.src = imgUrl;
+
+    // Handle label below — offset further to avoid overlap
+    const label = new SpriteText(`@${handle}`);
+    label.color = '#aaa';
+    label.textHeight = 1.8;
+    label.fontFace = 'SF Mono, Consolas, monospace';
+    label.backgroundColor = 'rgba(10, 10, 20, 0.85)';
+    label.padding = 0.5;
+    label.borderRadius = 1;
+    label.position.set(0, -(size / 2 + 3.5), 0);
+    group.add(label);
+
+    return group;
+  }
+
+  // Replace default nodes with avatar sprites
   graph.nodeThreeObject(node => {
-    const sprite = new SpriteText(`@${node.handle}`);
-    sprite.color = node.isSeed ? '#7c5cff' : '#666';
-    sprite.textHeight = node.isSeed ? 4 : 2.5;
-    sprite.fontFace = 'SF Mono, Consolas, monospace';
-    sprite.backgroundColor = 'rgba(10, 10, 20, 0.7)';
-    sprite.padding = 1;
-    sprite.borderRadius = 2;
-    return sprite;
+    const size = Math.max(6, node.size * 1.5);
+    return makeAvatarSprite(node.handle, size, node.color);
   });
 
-  graph.nodeThreeObjectExtend(true);
+  graph.nodeThreeObjectExtend(false);
+
+  // Edge labels — show connection reason at the midpoint
+  graph.linkThreeObject(link => {
+    const label = new SpriteText(linkLabel(link));
+    label.color = 'rgba(150, 130, 255, 0.7)';
+    label.textHeight = 1.2;
+    label.fontFace = 'SF Mono, Consolas, monospace';
+    label.backgroundColor = 'rgba(10, 10, 20, 0.6)';
+    label.padding = 0.3;
+    label.borderRadius = 1;
+    return label;
+  });
+  graph.linkThreeObjectExtend(true);
+  graph.linkPositionUpdate((sprite, { start, end }) => {
+    // Position label at midpoint of edge
+    const mid = ['x', 'y', 'z'].reduce((acc, k) => {
+      acc[k] = start[k] + (end[k] - start[k]) / 2;
+      return acc;
+    }, {});
+    Object.assign(sprite.position, mid);
+  });
 
   // Camera position
   setTimeout(() => {
@@ -609,49 +723,79 @@ function renderGraph(nodes, links) {
   }, 500);
 }
 
+function linkLabel(link) {
+  if (link.isReference) return 'references seed';
+  const pct = (link.similarity * 100).toFixed(0);
+  if (link.similarity >= 0.9) return `${pct}% identical`;
+  if (link.similarity >= 0.7) return `${pct}% near-duplicate`;
+  if (link.similarity >= 0.5) return `${pct}% similar`;
+  return `${pct}% overlap`;
+}
+
 // ── Detail Panel ──────────────────────────────────────────────────────
 
-function showDetail(node) {
+function showDetail(node, skipCamera) {
   const detail = document.getElementById('detail');
   detail.style.display = 'block';
 
-  document.getElementById('det-handle').textContent = `@${node.handle}`;
-  document.getElementById('det-handle').onclick = () => window.open(node.profileUrl, '_blank');
+  // Avatar
+  const avatar = document.getElementById('det-avatar');
+  avatar.src = `https://unavatar.io/x/${node.handle}`;
+  avatar.style.borderColor = node.color;
 
+  // Name + handle
+  document.getElementById('det-displayname').textContent = node.name || node.handle;
+  const handleEl = document.getElementById('det-handle');
+  handleEl.textContent = `@${node.handle}`;
+  handleEl.onclick = () => window.open(node.profileUrl, '_blank');
+
+  // Signal flags
+  const flagsEl = document.getElementById('det-flags');
+  flagsEl.innerHTML = '';
+  if (node.isSeed) flagsEl.innerHTML += '<span class="det-flag purple">SEED ACCOUNT</span>';
+  if (node.containsPhrase) flagsEl.innerHTML += '<span class="det-flag red">EXACT PHRASE</span>';
+  if (node.muskAdjacent) flagsEl.innerHTML += '<span class="det-flag orange">MUSK-ADJACENT</span>';
+  if (node.signal <= 0.3) flagsEl.innerHTML += '<span class="det-flag blue">LOW SIGNAL</span>';
+
+  // Meta
   const meta = [];
   if (node.followers) meta.push(`${node.followers.toLocaleString()} followers`);
   if (node.following) meta.push(`${node.following.toLocaleString()} following`);
   if (node.joined) meta.push(`Joined ${node.joined}`);
   if (node.likes) meta.push(`${node.likes} likes`);
   if (node.reposts) meta.push(`${node.reposts} reposts`);
+  const ts = node.timestamp ? new Date(node.timestamp) : null;
+  if (ts && !isNaN(ts)) meta.push(`Posted ${ts.toLocaleDateString()} ${ts.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`);
   document.getElementById('det-meta').textContent = meta.join(' · ');
 
+  // Bio + text
   document.getElementById('det-bio').textContent = node.bio || 'No bio';
   document.getElementById('det-text').textContent = node.text || 'No text';
 
-  const linkEl = document.getElementById('det-link');
-  linkEl.textContent = 'Open post →';
-  linkEl.onclick = () => window.open(node.url, '_blank');
+  // Links
+  const linksEl = document.getElementById('det-links');
+  linksEl.innerHTML = `
+    <a href="${node.profileUrl}" target="_blank">View Profile</a>
+    <a href="${node.url}" target="_blank">View Post</a>
+  `;
 
-  // Highlight signal indicators
-  const signals = [];
-  if (node.containsPhrase) signals.push('EXACT PHRASE MATCH');
-  if (node.muskAdjacent) signals.push('MUSK-ADJACENT');
-  if (node.isSeed) signals.push('SEED ACCOUNT');
-
-  if (signals.length > 0) {
-    document.getElementById('det-meta').textContent += '\n⚠ ' + signals.join(' · ');
-  }
-
-  // Pulse the node
   if (graph) {
-    graph.nodeColor(n => {
-      if (n.id === node.id) return '#ffffff';
-      return n.color;
-    });
-    setTimeout(() => {
-      graph.nodeColor(n => n.color);
-    }, 800);
+    // Fly camera to the node
+    if (!skipCamera && node.x !== undefined) {
+      graph.cameraPosition(
+        { x: node.x + 60, y: node.y + 30, z: node.z + 60 },
+        { x: node.x, y: node.y, z: node.z },
+        1000
+      );
+    }
+
+    // Pulse: scale up the avatar then back down
+    const obj = node.__threeObj;
+    if (obj) {
+      const orig = { x: obj.scale.x, y: obj.scale.y, z: obj.scale.z };
+      obj.scale.set(orig.x * 1.8, orig.y * 1.8, orig.z * 1.8);
+      setTimeout(() => obj.scale.set(orig.x, orig.y, orig.z), 600);
+    }
   }
 }
 

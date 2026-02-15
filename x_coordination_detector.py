@@ -143,47 +143,81 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
             # Persistent context saves cookies/login automatically — no manual save needed
             print(f"  [browser] Login state saved to profile (persistent)")
 
-        # Search for the query
-        encoded = query.replace(" ", "%20")
-        search_url = f"https://x.com/search?q=%22{encoded}%22&src=typed_query&f=live"
-        print(f"  [search] Navigating to search: {query}")
-        await page.goto(search_url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(4000)
+        # Build search queries — exact phrase + broad variations
+        search_queries = build_search_queries(query)
+        print(f"  [search] Running {len(search_queries)} search queries for broad coverage...")
 
-        # Scroll and collect
-        print(f"  [scroll] Collecting posts (max {max_scrolls} scrolls)...")
-        no_new_count = 0
+        for qi, (label, search_url) in enumerate(search_queries):
+            print(f"\n  [{qi+1}/{len(search_queries)}] {label}")
+            await page.goto(search_url, wait_until="domcontentloaded")
 
-        for scroll_i in range(max_scrolls):
-            # Extract tweet articles from the page
-            articles = await page.query_selector_all('article[data-testid="tweet"]')
-
-            new_this_scroll = 0
-            for article in articles:
-                try:
-                    post = await extract_post(article)
-                    if post and post.get("id") and post["id"] not in seen_ids:
-                        seen_ids.add(post["id"])
-                        posts.append(post)
-                        new_this_scroll += 1
-                except Exception as e:
-                    pass  # Skip unparseable tweets
-
-            if new_this_scroll == 0:
-                no_new_count += 1
-                if no_new_count >= 3:
-                    print(f"  [scroll] No new posts after {scroll_i+1} scrolls. Stopping.")
+            # Wait for content to actually load — poll for tweet articles
+            loaded = False
+            for wait_i in range(6):  # Up to 18 seconds
+                await page.wait_for_timeout(3000)
+                articles = await page.query_selector_all('article[data-testid="tweet"]')
+                if articles:
+                    loaded = True
+                    print(f"    Page loaded ({len(articles)} tweets visible)")
                     break
-            else:
-                no_new_count = 0
+                print(f"    Waiting for content... ({(wait_i+1)*3}s)")
+            if not loaded:
+                # Check if rate-limited vs genuinely no results
+                if await detect_rate_limit(page):
+                    print(f"    Rate limited! Waiting 60s before next query...")
+                    await page.wait_for_timeout(60000)
+                else:
+                    print(f"    No tweets found on this query, moving on.")
+                continue
 
-            print(f"    scroll {scroll_i+1}/{max_scrolls}: {len(posts)} posts collected (+{new_this_scroll})")
+            # Scroll and collect for this query
+            scrolls_per_query = max(3, max_scrolls // len(search_queries))
+            no_new_count = 0
+            rate_limit_retries = 0
 
-            # Scroll down
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-            await page.wait_for_timeout(2000 + (scroll_i * 200))  # Slow down to avoid rate limiting
+            for scroll_i in range(scrolls_per_query):
+                # Check for rate limiting before each scroll
+                if await detect_rate_limit(page):
+                    rate_limit_retries += 1
+                    if rate_limit_retries >= 3:
+                        print(f"    Rate limited 3 times — stopping this query.")
+                        break
+                    wait_time = 30 * rate_limit_retries  # 30s, 60s, 90s
+                    print(f"    Rate limit detected — waiting {wait_time}s (retry {rate_limit_retries}/3)...")
+                    await page.wait_for_timeout(wait_time * 1000)
+                    # Reload the search page
+                    await page.goto(search_url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(5000)
+                    continue
 
-        print(f"\n  [done] Collected {len(posts)} posts")
+                articles = await page.query_selector_all('article[data-testid="tweet"]')
+
+                new_this_scroll = 0
+                for article in articles:
+                    try:
+                        post = await extract_post(article)
+                        if post and post.get("id") and post["id"] not in seen_ids:
+                            seen_ids.add(post["id"])
+                            posts.append(post)
+                            new_this_scroll += 1
+                    except Exception as e:
+                        pass
+
+                if new_this_scroll == 0:
+                    no_new_count += 1
+                    if no_new_count >= 3:
+                        break
+                else:
+                    no_new_count = 0
+                    rate_limit_retries = 0  # Reset on successful collection
+
+                print(f"    scroll {scroll_i+1}/{scrolls_per_query}: {len(posts)} total (+{new_this_scroll})")
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+                await page.wait_for_timeout(3000 + (scroll_i * 300))  # Slower for bad internet
+
+            await page.wait_for_timeout(random.uniform(2000, 4000))  # Pause between queries
+
+        print(f"\n  [done] Collected {len(posts)} posts across {len(search_queries)} queries")
 
         # Now collect profile metadata for each unique author
         authors = list(set(p.get("author_handle", "") for p in posts if p.get("author_handle")))
@@ -254,6 +288,100 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
     return posts, profiles
 
 
+def build_search_queries(query):
+    """Build multiple X search URLs to catch exact matches AND variations.
+
+    For "Amanda Askell has no children" this generates:
+    1. Exact phrase: "Amanda Askell has no children"
+    2. Name + keywords: "Amanda Askell" children
+    3. Name + synonyms: "Amanda Askell" childless
+    4. Name + attack terms: "Amanda Askell" (mother OR parent OR children)
+    5. Just the name (broad): "Amanda Askell" Claude
+
+    This catches copy-paste AND original phrasings of the same attack.
+    """
+    base = "https://x.com/search?src=typed_query&f=live&q="
+    queries = []
+
+    # 1. Full phrase (no quotes — let X find relevant posts naturally)
+    encoded_full = query.replace(" ", "%20")
+    queries.append((f'All words: {query}', f"{base}{encoded_full}"))
+
+    # 2. Extract likely person name and keywords
+    # Heuristic: common stop/filler words are keywords, everything else is name
+    words = query.split()
+    stop_words = {"has", "have", "had", "the", "this", "that", "with", "from",
+                  "been", "were", "they", "them", "what", "when", "about", "into",
+                  "is", "are", "was", "and", "but", "for", "not", "its", "his",
+                  "her", "our", "who", "why", "how", "can", "will", "does", "did",
+                  "no", "yes", "all", "any", "some", "very", "too", "also", "just"}
+
+    name_words = []
+    keyword_words = []
+    for w in words:
+        wl = w.lower()
+        # Name = first 2 non-stop words (first name + last name)
+        if wl not in stop_words and len(name_words) < 2 and not keyword_words:
+            name_words.append(w.capitalize())
+        else:
+            if wl not in stop_words and len(wl) > 2:
+                keyword_words.append(wl)
+
+    # Filter keywords to significant ones
+    keyword_words = [w for w in keyword_words if w not in stop_words and len(w) > 2]
+
+    if len(name_words) >= 2:
+        name = " ".join(name_words)
+        name_enc = f'%22{name.replace(" ", "%20")}%22'
+
+        # 3. Name + each significant keyword
+        sig_keywords = keyword_words  # Already filtered above
+
+        if sig_keywords:
+            kw_str = "%20".join(sig_keywords)
+            queries.append((f'Name + keywords: "{name}" {" ".join(sig_keywords)}',
+                           f"{base}{name_enc}%20{kw_str}"))
+
+        # 4. Name + common attack synonyms
+        # Map keywords to synonyms for broader coverage
+        synonym_map = {
+            "children": ["childless", "mother", "parent", "kids"],
+            "childless": ["children", "mother", "parent", "kids"],
+            "mother": ["childless", "parent", "children"],
+            "parent": ["childless", "mother", "children"],
+            "teaching": ["training", "programming", "instilling"],
+            "bizarre": ["dangerous", "weird", "crazy", "insane"],
+        }
+
+        synonyms_used = set()
+        for kw in sig_keywords:
+            for syn in synonym_map.get(kw, []):
+                if syn not in synonyms_used and syn not in sig_keywords:
+                    synonyms_used.add(syn)
+                    queries.append((f'Name + synonym: "{name}" {syn}',
+                                   f"{base}{name_enc}%20{syn}"))
+                    if len(queries) >= 6:  # Cap total queries to avoid rate limit
+                        break
+            if len(queries) >= 6:
+                break
+
+        # 5. Name + OR group for broad catch
+        if sig_keywords and len(queries) < 7:
+            or_group = "%20OR%20".join(sig_keywords[:4])
+            queries.append((f'Name + broad: "{name}" ({" OR ".join(sig_keywords[:4])})',
+                           f"{base}{name_enc}%20({or_group})"))
+
+    # Deduplicate by URL
+    seen = set()
+    unique = []
+    for label, url in queries:
+        if url not in seen:
+            seen.add(url)
+            unique.append((label, url))
+
+    return unique
+
+
 def _save_progress(posts, profiles, query, script_dir):
     """Save partial results so nothing is lost if rate-limited or interrupted."""
     progress = {
@@ -267,6 +395,36 @@ def _save_progress(posts, profiles, query, script_dir):
     with open(path, "w") as f:
         json.dump(progress, f, indent=2, default=str)
     return path
+
+
+async def detect_rate_limit(page):
+    """Check if X is showing a rate limit, error page, or blank page.
+
+    Returns True if we're rate-limited and should wait before continuing.
+    """
+    try:
+        body_text = await page.inner_text("body")
+    except Exception:
+        return True  # Can't even read the page — treat as rate limited
+
+    body_lower = (body_text or "").lower().strip()
+
+    # Known rate limit / error indicators
+    rate_indicators = [
+        "rate limit", "try again later", "something went wrong",
+        "this page isn", "account suspended", "doesn't exist",
+        "content isn't available", "retry", "too many requests",
+        "over capacity", "unable to",
+    ]
+
+    if any(ind in body_lower for ind in rate_indicators):
+        return True
+
+    # Nearly blank page = likely silent rate limit
+    if len(body_lower) < 50:
+        return True
+
+    return False
 
 
 async def extract_post(article):
@@ -338,7 +496,12 @@ async def collect_profile(page, handle):
     profile = {"handle": handle}
 
     await page.goto(f"https://x.com/{handle}", wait_until="domcontentloaded")
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(3000)
+
+    # Check for rate limiting before trying to extract
+    if await detect_rate_limit(page):
+        profile["error"] = "rate_limited"
+        return profile
 
     # Display name
     try:
@@ -435,6 +598,13 @@ def analyze_coordination(posts, profiles, query):
         if "display_name" in p and "author_name" not in p:
             p["author_name"] = p["display_name"]
 
+    # Filter out AI bot accounts (Grok, etc.) — they're noise, not coordination
+    bot_handles = {"grok", "chatgpt", "copilot", "gemini", "claude", "perplexity_ai"}
+    original_count = len(posts)
+    posts = [p for p in posts if p.get("author_handle", "").lower() not in bot_handles]
+    if len(posts) < original_count:
+        print(f"  [filter] Removed {original_count - len(posts)} AI bot posts (Grok, etc.)")
+
     report = {
         "query": query,
         "collection_time": datetime.now(timezone.utc).isoformat(),
@@ -496,12 +666,11 @@ def analyze_coordination(posts, profiles, query):
 
 
 def analyze_text_similarity(texts, query):
-    """Measure exact/near duplication across posts."""
+    """Measure exact/near duplication and narrative similarity across posts."""
     if not texts:
         return {"error": "no texts"}
 
     n = len(texts)
-    query_lower = query.lower()
 
     # Normalize texts for comparison
     normed = [t.lower().strip() for t in texts]
@@ -511,24 +680,70 @@ def analyze_text_similarity(texts, query):
     exact_dupes = {text: count for text, count in counter.items() if count > 1}
     exact_dupe_count = sum(c for c in counter.values() if c > 1)
 
-    # Near-duplicate pairs (Jaccard on word sets)
+    # Near-duplicate pairs (SequenceMatcher for fuzzy matching)
     near_dupes = 0
+    similarity_scores = []
     for i in range(n):
         for j in range(i + 1, n):
             sim = SequenceMatcher(None, normed[i], normed[j]).ratio()
-            if sim > 0.7:
+            similarity_scores.append(sim)
+            if sim > 0.6:  # Lowered from 0.7 — catch close paraphrases
                 near_dupes += 1
 
-    # How many contain the exact query phrase
-    exact_phrase_matches = sum(1 for t in normed if query_lower in t)
+    # Average pairwise similarity — high = everyone saying the same thing
+    avg_similarity = mean(similarity_scores) if similarity_scores else 0
+
+    # Phrase matching: use KEY TERMS from query, not exact string
+    # "amanda askell children" → check for "askell" AND ("children" OR "childless" OR "child")
+    query_words = set(query.lower().split())
+    stop = {"has", "have", "had", "the", "this", "that", "with", "from", "is", "are",
+            "was", "and", "but", "for", "not", "no", "who", "why", "how", "does", "did",
+            "just", "very", "too", "also", "about", "into", "been"}
+    key_terms = [w for w in query_words if w not in stop and len(w) > 2]
+
+    # Count posts containing ALL key terms (or close variants)
+    def has_key_terms(text, terms):
+        """Check if text contains all key terms or their common variants."""
+        variants = {
+            "children": {"children", "child", "childless", "kids"},
+            "childless": {"children", "child", "childless", "kids"},
+            "mother": {"mother", "mom", "parent", "parenting", "maternal"},
+            "parent": {"parent", "parenting", "mother", "father", "mom", "dad"},
+        }
+        text_words = set(re.findall(r'\b\w+\b', text.lower()))
+        for term in terms:
+            term_set = variants.get(term, {term})
+            if not term_set.intersection(text_words):
+                return False
+        return True
+
+    phrase_matches = sum(1 for t in normed if has_key_terms(t, key_terms))
+
+    # ── Narrative Frame Detection ──
+    # Detect posts sharing the same ATTACK STRUCTURE regardless of exact wording
+    # Frame: [target person] + [disqualifier] + [implication about fitness/authority]
+    narrative_patterns = [
+        r'(?:askell|amanda).*(?:child|kids|mother|parent)',  # name + family angle
+        r'(?:child|kids|mother|parent).*(?:askell|amanda)',  # family angle + name
+        r'(?:childless|no\s+children|has\s+no\s+kids).*(?:teach|train|decid|instill|program)',  # childless + authority
+        r'(?:teach|train|decid|instill).*(?:childless|no\s+children|without\s+children)',  # authority + childless
+        r'(?:childless|no\s+children).*(?:moral|ethic|right|wrong|values)',  # childless + morality
+    ]
+    narrative_matches = 0
+    for t in normed:
+        if any(re.search(pat, t) for pat in narrative_patterns):
+            narrative_matches += 1
 
     return {
         "total_texts": n,
         "exact_duplicates": len(exact_dupes),
         "exact_duplicate_posts": exact_dupe_count,
         "near_duplicate_pairs": near_dupes,
-        "exact_phrase_matches": exact_phrase_matches,
-        "phrase_match_rate": exact_phrase_matches / n if n > 0 else 0,
+        "avg_pairwise_similarity": round(avg_similarity, 3),
+        "exact_phrase_matches": phrase_matches,
+        "phrase_match_rate": phrase_matches / n if n > 0 else 0,
+        "narrative_frame_matches": narrative_matches,
+        "narrative_frame_rate": narrative_matches / n if n > 0 else 0,
         "most_common_texts": counter.most_common(10),
         "uniqueness_ratio": len(set(normed)) / n if n > 0 else 1.0,
     }
@@ -737,38 +952,51 @@ def compute_coordination_score(text, temporal, accounts, bios):
     components = {}
     reasons = []
 
-    # ── 1. TEXT DUPLICATION (the strongest signal) ──
-    # Not just "do they mention the phrase?" but "are they copy-pasting?"
+    # ── 1. TEXT & NARRATIVE SIMILARITY (the strongest signals) ──
     if "phrase_match_rate" in text:
         pmr = text["phrase_match_rate"]
         uniqueness = text.get("uniqueness_ratio", 1.0)
         n_dupes = text.get("exact_duplicate_posts", 0)
         n_near = text.get("near_duplicate_pairs", 0)
         n_total = text.get("total_texts", 1)
+        avg_sim = text.get("avg_pairwise_similarity", 0)
+        narrative_rate = text.get("narrative_frame_rate", 0)
 
-        # Exact duplicates are the gold standard of coordination
+        # Copy-paste signal (exact duplicates + low uniqueness)
+        copy_paste_signal = (1 - uniqueness)
         dupe_rate = n_dupes / max(n_total, 1)
-        near_dupe_rate = n_near / max(n_total * (n_total - 1) / 2, 1)  # fraction of all pairs
+        near_dupe_rate = n_near / max(n_total * (n_total - 1) / 2, 1)
 
-        # Organic patterns: people mention the same phrase but say different things
-        # Coordinated: exact copy-paste with minor variations
-        # Key: low uniqueness = many identical texts = coordination
-        copy_paste_signal = (1 - uniqueness)  # 0 = all unique, 1 = all identical
+        # Narrative convergence: same attack frame, different words
+        # This is the KEY signal that separates coordinated from organic
+        # Organic: diverse opinions. Coordinated: same frame, same talking points.
+        narrative_signal = narrative_rate  # 0 = no shared frame, 1 = all same frame
 
-        # Combine: phrase match matters less than actual duplication
+        # Average pairwise similarity: how similar are all posts to each other?
+        # Organic on a topic: avg ~0.15-0.25. Coordinated: avg ~0.35+
+        similarity_signal = min(avg_sim * 3, 1.0)  # Scale: 0.33 → 1.0
+
+        # Combine: narrative > copy-paste > raw similarity
         text_score = (
-            copy_paste_signal * 0.5 +    # Are they copy-pasting? (most important)
-            dupe_rate * 0.3 +              # Exact duplicates
-            near_dupe_rate * 0.2           # Near-duplicates
+            narrative_signal * 0.35 +     # Same attack frame (most revealing)
+            copy_paste_signal * 0.25 +     # Copy-paste
+            near_dupe_rate * 0.20 +        # Near-duplicates
+            similarity_signal * 0.20       # Overall similarity
         )
 
         components["text_duplication"] = min(text_score, 1.0)
+        if narrative_rate > 0.4:
+            reasons.append(f"{narrative_rate*100:.0f}% of posts share the same narrative attack frame")
         if copy_paste_signal > 0.4:
             reasons.append(f"Only {uniqueness*100:.0f}% unique texts — significant copy-pasting detected")
         if n_dupes > 2:
             reasons.append(f"{n_dupes} posts are exact duplicates")
-        if pmr > 0.7:
-            reasons.append(f"{pmr*100:.0f}% of posts contain the exact search phrase")
+        if n_near > 3:
+            reasons.append(f"{n_near} near-duplicate pairs detected (>60% similar)")
+        if pmr > 0.5:
+            reasons.append(f"{pmr*100:.0f}% of posts match the target narrative keywords")
+        if avg_sim > 0.25:
+            reasons.append(f"Average text similarity {avg_sim*100:.0f}% (organic baseline ~15%)")
 
     # ── 2. TEMPORAL CLUSTERING ──
     # Use log-scaled p-value so it's not binary
@@ -1461,7 +1689,10 @@ async def run_demo(script_dir):
 
 def open_visualization(script_dir, json_path, report=None):
     """Create and open the 3D visualization via local HTTP server."""
-    viz_path = os.path.join(script_dir, "coordination_web.html")
+    # Prefer the inlined template (no CDN dependencies, works everywhere)
+    viz_path_inlined = os.path.join(script_dir, "coordination_web_inlined.html")
+    viz_path_cdn = os.path.join(script_dir, "coordination_web.html")
+    viz_path = viz_path_inlined if os.path.exists(viz_path_inlined) else viz_path_cdn
 
     # Always tell users about the hosted viz
     json_abs = os.path.abspath(json_path)
