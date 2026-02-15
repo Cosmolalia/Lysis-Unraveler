@@ -59,36 +59,51 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
     # Find a usable browser — prefer system Chromium over Playwright's headless shell
     system_chromium = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
 
+    # Use a persistent profile directory so the browser looks real to Google/X
+    # This also preserves login between runs — no need to log in every time
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    profile_dir = os.path.join(script_dir, ".browser_profile")
+
     async with async_playwright() as p:
-        # Launch browser — use system Chromium so we get a VISIBLE window for login
-        launch_opts = {"headless": headless}
+        # Use a persistent context — this creates a real browser profile
+        # that Google/X won't flag as automation
+        launch_opts = {
+            "headless": headless,
+            "viewport": {"width": 1280, "height": 900},
+            "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+
         if not headless and system_chromium:
             launch_opts["executable_path"] = system_chromium
             print(f"  [browser] Using system browser: {system_chromium}")
 
+        # Persistent context keeps cookies, history, and login state between runs
+        # It also bypasses Google's "automated browser" detection
+        print(f"  [browser] Profile: {profile_dir}")
         try:
-            browser = await p.chromium.launch(**launch_opts)
+            context = await p.chromium.launch_persistent_context(
+                profile_dir,
+                **launch_opts,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
         except Exception as e:
-            # Fallback: try Playwright's bundled browser
+            # Fallback without system browser
             print(f"  [browser] System browser failed ({e}), trying Playwright's...")
-            browser = await p.chromium.launch(headless=headless)
+            if "executable_path" in launch_opts:
+                del launch_opts["executable_path"]
+            context = await p.chromium.launch_persistent_context(
+                profile_dir,
+                **launch_opts,
+            )
 
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        browser = None  # persistent context IS the browser
 
-        # Load cookies if available
-        if cookie_file and os.path.exists(cookie_file):
-            try:
-                with open(cookie_file) as f:
-                    cookies = json.load(f)
-                await context.add_cookies(cookies)
-                print(f"  [cookies] Loaded from {cookie_file}")
-            except Exception:
-                print(f"  [cookies] Could not load {cookie_file}, starting fresh")
-
-        page = await context.new_page()
+        page = context.pages[0] if context.pages else await context.new_page()
 
         # Navigate to X
         print("  [browser] Opening X...")
@@ -115,24 +130,17 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, input, "\n  Press ENTER when logged in > ")
 
-            # Give the page a moment to settle
+            # Give the page a moment to settle after login
             try:
                 await page.wait_for_timeout(2000)
             except Exception:
                 # Page might have navigated during login — reload
+                page = context.pages[-1] if context.pages else await context.new_page()
                 await page.goto("https://x.com", wait_until="domcontentloaded")
                 await page.wait_for_timeout(2000)
 
-            # Save cookies for next time
-            if cookie_file:
-                try:
-                    cookies = await context.cookies()
-                    os.makedirs(os.path.dirname(cookie_file) if os.path.dirname(cookie_file) else ".", exist_ok=True)
-                    with open(cookie_file, "w") as f:
-                        json.dump(cookies, f)
-                    print(f"  [cookies] Saved to {cookie_file}")
-                except Exception:
-                    pass
+            # Persistent context saves cookies/login automatically — no manual save needed
+            print(f"  [browser] Login state saved to profile (persistent)")
 
         # Search for the query
         encoded = query.replace(" ", "%20")
@@ -193,7 +201,8 @@ async def collect_posts(query, max_scrolls=15, headless=False, cookie_file=None)
                 profiles[handle] = {"handle": handle, "error": str(e)}
             await page.wait_for_timeout(1500)  # Rate limiting
 
-        await browser.close()
+        # Close the persistent context (saves cookies/state automatically)
+        await context.close()
 
     return posts, profiles
 
