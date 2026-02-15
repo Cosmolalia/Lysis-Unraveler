@@ -322,11 +322,21 @@ def parse_count(s):
 
 def analyze_coordination(posts, profiles, query):
     """Run full coordination analysis on collected data."""
+
+    # Normalize keys — accept both scraper format and demo/import format
+    for p in posts:
+        if "handle" in p and "author_handle" not in p:
+            p["author_handle"] = p["handle"]
+        if "text_snippet" in p and "text" not in p:
+            p["text"] = p["text_snippet"]
+        if "display_name" in p and "author_name" not in p:
+            p["author_name"] = p["display_name"]
+
     report = {
         "query": query,
         "collection_time": datetime.now(timezone.utc).isoformat(),
         "total_posts": len(posts),
-        "unique_authors": len(set(p.get("author_handle", "") for p in posts)),
+        "unique_authors": len(set(p.get("author_handle", "") for p in posts if p.get("author_handle"))),
     }
 
     # ── 1. Text Similarity Analysis ──
@@ -793,84 +803,350 @@ def generate_report(report):
     return "\n".join(lines)
 
 
-# ── Main ───────────────────────────────────────────────────────────────
+# ── ANSI Colors ────────────────────────────────────────────────────────
 
-async def main():
-    parser = argparse.ArgumentParser(
-        description="Detect coordinated inauthentic behavior on X",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 x_coordination_detector.py "Amanda Askell has no children"
-  python3 x_coordination_detector.py "exact phrase to search" --max-scroll 25
-  python3 x_coordination_detector.py "phrase" --headless  # no browser window
-        """
-    )
-    parser.add_argument("query", help="The phrase to search for on X")
-    parser.add_argument("--max-scroll", type=int, default=15, help="Max scrolls in search results (default: 15)")
-    parser.add_argument("--headless", action="store_true", help="Run browser without visible window (needs saved cookies)")
-    parser.add_argument("--output", "-o", default=None, help="Output JSON file (default: data/coordination_report.json)")
-    parser.add_argument("--cookies", default=None, help="Cookie file path for persistent login")
-    parser.add_argument("--no-viz", action="store_true", help="Skip opening the 3D visualization")
-    args = parser.parse_args()
+class C:
+    """ANSI color codes for terminal output."""
+    PURPLE = "\033[95m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    RESET  = "\033[0m"
+
+def banner():
+    print(f"""
+{C.PURPLE}{C.BOLD}
+    ██╗  ██╗   ██╗███████╗██╗███████╗
+    ██║  ╚██╗ ██╔╝██╔════╝██║██╔════╝
+    ██║   ╚████╔╝ ███████╗██║███████╗
+    ██║    ╚██╔╝  ╚════██║██║╚════██║
+    ███████╗██║   ███████║██║███████║
+    ╚══════╝╚═╝   ╚══════╝╚═╝╚══════╝
+       ╦ ╦╔╗╔╦═╗╔═╗╦  ╦╔═╗╦  ╔═╗╦═╗
+       ║ ║║║║╠╦╝╠═╣╚╗╔╝║╣ ║  ║╣ ╠╦╝
+       ╚═╝╝╚╝╩╚═╩ ╩ ╚╝ ╚═╝╩═╝╚═╝╩╚═{C.RESET}
+{C.DIM}    Coordination Detection for X/Twitter
+    github.com/Cosmolalia/Lysis-Unraveler{C.RESET}
+""")
+
+def step(num, text):
+    print(f"\n{C.CYAN}{C.BOLD}  [{num}]{C.RESET} {C.BOLD}{text}{C.RESET}")
+
+def info(text):
+    print(f"  {C.DIM}{text}{C.RESET}")
+
+def success(text):
+    print(f"  {C.GREEN}{text}{C.RESET}")
+
+def warn(text):
+    print(f"  {C.YELLOW}{text}{C.RESET}")
+
+def error(text):
+    print(f"  {C.RED}{text}{C.RESET}")
+
+def ask(prompt, default=None):
+    if default:
+        raw = input(f"  {C.PURPLE}>{C.RESET} {prompt} {C.DIM}[{default}]{C.RESET}: ").strip()
+        return raw if raw else default
+    else:
+        return input(f"  {C.PURPLE}>{C.RESET} {prompt}: ").strip()
+
+def confirm(prompt, default_yes=True):
+    hint = "Y/n" if default_yes else "y/N"
+    raw = input(f"  {C.PURPLE}>{C.RESET} {prompt} {C.DIM}[{hint}]{C.RESET}: ").strip().lower()
+    if not raw:
+        return default_yes
+    return raw in ("y", "yes")
+
+
+# ── Demo Data Generator ───────────────────────────────────────────────
+
+def generate_demo_report():
+    """Generate a realistic demo report for testing the full pipeline."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+
+    posts_data = [
+        ("gailalfaratx", "Gail Alfar", 'Why Amanda Askell, the 37-year-old philosopher at Anthropic who\'s leading efforts to instill "good character" into their AI, Claude, is the wrong choice! A thread. 🧵', -36, 123000, 599, "Writer. Support Elon Musk and Tesla. Austin, Texas.", "Jan 2020", 847, 312),
+        ("tesla_mom_tx", "Tesla Mom TX", "Amanda Askell has no children and is teaching Claude bizarre things. As a mother I find this deeply concerning.", -28, 4200, 890, "Tesla Model Y owner. Mother of 3. Texas forever. Elon supporter.", "Mar 2021", 124, 67),
+        ("patriot_ai_watch", "AI Watchdog", "Amanda Askell has no children and is teaching Claude bizarre things. Who approved this??", -26, 890, 2100, "Watching Big Tech. MAGA. God first. Fighting for our kids' future.", "Nov 2022", 89, 45),
+        ("freedom_eagle_us", "Freedom Eagle", "Amanda Askell has no children and is teaching Claude bizarre things", -24, 340, 1800, "Patriot. Conservative. Support Elon Musk. USA first.", "Aug 2023", 23, 12),
+        ("real_talk_sarah", "Sarah J", "Amanda Askell has no children. Why is she deciding AI morals? This is insane.", -22, 1200, 450, "Mom. Wife. Tesla fan. Speaking truth.", "Feb 2022", 156, 78),
+        ("musk_world_news", "Musk World News", "Amanda Askell has no children and is teaching Claude bizarre things. Meanwhile Grok is built by parents who understand responsibility.", -20, 28000, 340, "Latest news about Elon Musk, Tesla, SpaceX, and xAI.", "Jan 2023", 534, 267),
+        ("concerned_dad_07", "Concerned Dad", "Amanda Askell has no children and is teaching Claude bizarre things. Let that sink in.", -18, 127, 890, "Father of 4. Christian conservative. Anti-woke.", "Sep 2023", 34, 19),
+        ("techtruth2024", "Tech Truth", "This childless woman is teaching Claude right from wrong. Let that sink in.", -16, 5600, 1200, "Tech news without the spin. Tesla investor. Free speech.", "May 2022", 201, 95),
+        ("mama_bear_usa", "Mama Bear", "Amanda Askell has no children and is teaching Claude bizarre things. A real mother would never approve this.", -12, 2100, 670, "Protecting our kids from Big Tech. Mother of 5. MAGA.", "Oct 2022", 178, 89),
+        ("evfuture_now", "EV Future", "Amanda Askell has no children. She compares training Claude to 'raising a child.' The hubris.", -10, 8900, 420, "Electric vehicle advocate. Tesla since 2019. SpaceX fan.", "Jul 2021", 312, 145),
+        ("ai_ethics_real", "Real AI Ethics", "I have serious concerns about Amanda Askell's approach to Claude's personality. Interesting thread from @gailalfaratx", -8, 3400, 1500, "AI ethics researcher (independent). Skeptical of corporate alignment.", "Apr 2023", 67, 23),
+        ("liberty_lens_us", "Liberty Lens", "Amanda Askell has no children and is teaching Claude bizarre things. We need parents making these decisions, not childless philosophers.", -6, 670, 2300, "Conservative. Freedom. 2A. Elon fan. Fighting the woke machine.", "Dec 2023", 45, 22),
+        ("teslafan_mike", "Mike T", "Amanda Askell has no children and is teaching Claude bizarre things", -5, 1800, 560, "Tesla Model 3 owner. Austin TX. Support Elon.", "Jun 2021", 56, 28),
+        ("wake_up_america_x", "Wake Up America", "Amanda Askell has no children and is teaching Claude bizarre things. The elites want AI to parent YOUR children.", -4, 15000, 280, "Truth. Freedom. God. Country. Fighting globalism.", "Mar 2022", 423, 198),
+        ("spacex_daily_", "SpaceX Daily", "Amanda Askell has no children. Who at Anthropic thought this was a good idea for someone designing AI morality?", -3, 34000, 150, "Daily SpaceX news. Also covering Tesla and xAI. Not affiliated with SpaceX.", "Aug 2020", 267, 134),
+        ("claude_skeptic", "Claude Skeptic", "Amanda Askell has no children and is teaching Claude bizarre things. Switch to Grok — built by people who get it.", -2, 450, 3200, "Former Claude user. Now Grok. Elon knows AI.", "Jan 2024", 89, 45),
+        ("traditional_val", "Traditional Values", "This childless woman is teaching Claude right from wrong. Let that sink in. Thread by @gailalfaratx is a must-read.", -1.5, 7800, 890, "Faith. Family. Freedom. Conservative values in a liberal world.", "Nov 2021", 345, 167),
+        ("organic_critic", "Thoughtful AI Critic", "I disagree with some of Askell's approaches to Claude's constitution, particularly around moral relativism in edge cases. Worth reading the actual document though.", -0.5, 12000, 800, "AI safety researcher. PhD. Opinions are my own. Previously at DeepMind.", "Mar 2019", 234, 12),
+    ]
+
+    query = "Amanda Askell has no children"
+    posts = []
+    profiles = {}
+
+    for handle, name, text, hours_ago, followers, following, bio, joined, likes, reposts in posts_data:
+        ts = (now + timedelta(hours=hours_ago)).isoformat()
+        posts.append({
+            "handle": handle,
+            "display_name": name,
+            "text_snippet": text,
+            "timestamp": ts,
+            "followers": followers,
+            "following": following,
+            "bio": bio,
+            "joined": joined,
+            "likes": likes,
+            "reposts": reposts,
+            "url": f"https://x.com/{handle}/status/example",
+        })
+        profiles[handle] = {
+            "handle": handle,
+            "display_name": name,
+            "bio": bio,
+            "followers": followers,
+            "following": following,
+            "joined": joined,
+        }
+
+    return posts, profiles, query
+
+
+# ── Wizard Mode ────────────────────────────────────────────────────────
+
+async def wizard():
+    """Interactive wizard for users who just want to run the thing."""
+    banner()
+
+    print(f"""  {C.BOLD}Welcome to Lysis Unraveler.{C.RESET}
+
+  This tool detects coordinated campaigns on X (Twitter).
+  It searches for a phrase you've seen repeated, collects
+  every account that posted it, and runs statistical tests
+  to determine if the pattern is organic or coordinated.
+
+  {C.DIM}No API keys needed. No paid services. Just a browser.{C.RESET}
+""")
+
+    # Step 1: Choose mode
+    step(1, "What would you like to do?")
+    print(f"""
+      {C.PURPLE}a){C.RESET} Search X for a phrase           {C.DIM}(opens browser, you log in){C.RESET}
+      {C.PURPLE}b){C.RESET} Run demo with sample data       {C.DIM}(no login needed, test the tool){C.RESET}
+      {C.PURPLE}c){C.RESET} Analyze existing JSON report     {C.DIM}(re-run analysis on saved data){C.RESET}
+""")
+    mode = ask("Choose a, b, or c", "a").lower()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_path = args.output or os.path.join(script_dir, "coordination_report.json")
-    cookie_path = args.cookies or os.path.join(script_dir, ".x_cookies.json")
 
-    print("=" * 70)
-    print("  X COORDINATION DETECTOR")
-    print("  Searches for coordinated inauthentic behavior")
-    print("=" * 70)
-    print(f"  Query: \"{args.query}\"")
-    print(f"  Max scrolls: {args.max_scroll}")
-    print(f"  Output: {output_path}")
+    if mode == "b":
+        await run_demo(script_dir)
+        return
+
+    if mode == "c":
+        json_path = ask("Path to JSON report file")
+        if not os.path.exists(json_path):
+            error(f"File not found: {json_path}")
+            return
+        with open(json_path) as f:
+            report = json.load(f)
+        text_report = generate_report(report)
+        print("\n" + text_report)
+        if confirm("Open 3D visualization?"):
+            open_visualization(script_dir, json_path, report)
+        return
+
+    # Mode A: Full search
+    step(2, "What phrase are you seeing repeated?")
+    info("Paste the exact text you've seen duplicated across accounts.")
+    info("The tool will search X for this exact phrase in quotes.")
+    print()
+    query = ask("Search phrase")
+
+    if not query:
+        error("No phrase entered. Exiting.")
+        return
+
+    step(3, "How deep should we search?")
+    info("More scrolls = more posts found, but takes longer.")
+    info("10 scrolls ~ 1-2 minutes. 30 scrolls ~ 5-8 minutes.")
+    print()
+    max_scrolls = int(ask("Number of scrolls", "15"))
+
+    step(4, "Where should we save the report?")
+    default_output = os.path.join(script_dir, "coordination_report.json")
+    output_path = ask("Output file", default_output)
+
+    cookie_path = os.path.join(script_dir, ".x_cookies.json")
+
+    # Summary before launch
+    print(f"""
+{C.CYAN}{'─' * 60}{C.RESET}
+  {C.BOLD}Ready to launch:{C.RESET}
+
+  Phrase:    "{C.YELLOW}{query}{C.RESET}"
+  Scrolls:   {max_scrolls}
+  Output:    {output_path}
+{C.CYAN}{'─' * 60}{C.RESET}
+""")
+
+    if not confirm("Start the search?"):
+        info("Cancelled.")
+        return
+
+    # Step 5: Check Playwright
+    step(5, "Checking browser setup...")
+    try:
+        from playwright.async_api import async_playwright
+        success("Playwright found.")
+    except ImportError:
+        error("Playwright not installed!")
+        print(f"""
+  {C.BOLD}Run these two commands to install it:{C.RESET}
+
+    pip install playwright
+    playwright install chromium
+
+  {C.DIM}Then run this tool again.{C.RESET}
+""")
+        return
+
+    # Step 6: Collect
+    step(6, "Opening browser and searching X...")
+    info("A browser window will open. Log into X if prompted.")
+    info("Then come back to this terminal and press Enter.")
     print()
 
-    # Collect
     posts, profiles = await collect_posts(
-        args.query,
-        max_scrolls=args.max_scroll,
-        headless=args.headless,
+        query,
+        max_scrolls=max_scrolls,
+        headless=False,
         cookie_file=cookie_path,
     )
 
     if not posts:
-        print("\n  NO POSTS FOUND. Try a different search query.")
+        error("No posts found. Try a different phrase or check your X login.")
         return
 
-    # Analyze
-    print("\n  [analysis] Running coordination detection...")
-    report = analyze_coordination(posts, profiles, args.query)
+    success(f"Collected {len(posts)} posts from {len(set(p.get('author_handle','') for p in posts))} accounts.")
 
-    # Report
+    # Step 7: Analyze
+    step(7, "Running coordination analysis...")
+    info("Testing text similarity, temporal clustering, bio patterns, account profiles...")
+    print()
+
+    report = analyze_coordination(posts, profiles, query)
+
+    # Show results
+    text_report = generate_report(report)
+    print("\n" + text_report)
+
+    # Step 8: Save
+    step(8, "Saving results...")
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    success(f"JSON report  → {output_path}")
+
+    text_path = output_path.replace(".json", "_report.txt")
+    with open(text_path, "w") as f:
+        f.write(text_report)
+    success(f"Text report  → {text_path}")
+
+    # Step 9: Visualization
+    step(9, "3D Visualization")
+    if confirm("Open the interactive 3D coordination web?"):
+        open_visualization(script_dir, output_path, report)
+
+    # Done
+    print(f"""
+{C.GREEN}{C.BOLD}{'═' * 60}
+  DONE. Here's what was generated:
+{'═' * 60}{C.RESET}
+
+  {C.CYAN}JSON data:{C.RESET}   {output_path}
+  {C.CYAN}Text report:{C.RESET} {text_path}
+
+  {C.DIM}Share the report. Fork the tool. Sunlight is the best disinfectant.{C.RESET}
+  {C.DIM}github.com/Cosmolalia/Lysis-Unraveler{C.RESET}
+""")
+
+
+async def run_demo(script_dir):
+    """Run a full demo with synthetic data."""
+    step(2, "Generating demo campaign data...")
+    info("18 simulated accounts, realistic coordination patterns.")
+    print()
+
+    posts, profiles, query = generate_demo_report()
+    success(f"Generated {len(posts)} posts from {len(profiles)} accounts.")
+
+    step(3, "Running coordination analysis on demo data...")
+    info("Same statistical tests as a live search.")
+    print()
+
+    report = analyze_coordination(posts, profiles, query)
+
     text_report = generate_report(report)
     print("\n" + text_report)
 
     # Save
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_path = os.path.join(script_dir, "demo_report.json")
     with open(output_path, "w") as f:
         json.dump(report, f, indent=2, default=str)
-    print(f"\n  [save] Full report → {output_path}")
+    success(f"Demo report → {output_path}")
 
-    # Also save text report
     text_path = output_path.replace(".json", "_report.txt")
     with open(text_path, "w") as f:
         f.write(text_report)
-    print(f"  [save] Text report → {text_path}")
+    success(f"Text report → {text_path}")
 
-    # Open visualization
-    if not args.no_viz:
-        viz_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coordination_web.html")
-        if os.path.exists(viz_path):
-            import webbrowser
-            # The HTML loads JSON via drag-drop, so also create an auto-load version
-            auto_viz = output_path.replace(".json", "_viz.html")
-            create_autoload_viz(viz_path, output_path, auto_viz)
-            print(f"  [viz] Opening 3D coordination web → {auto_viz}")
-            webbrowser.open(f"file://{os.path.abspath(auto_viz)}")
-        else:
-            print(f"  [viz] coordination_web.html not found at {viz_path}")
+    step(4, "3D Visualization")
+    if os.environ.get("LYSIS_NO_PROMPT"):
+        # Non-interactive mode (for testing)
+        open_visualization(script_dir, output_path, report)
+    elif confirm("Open the interactive 3D coordination web?"):
+        open_visualization(script_dir, output_path, report)
+
+    cs = report.get("coordination_score", {})
+    print(f"""
+{C.GREEN}{C.BOLD}{'═' * 60}
+  DEMO COMPLETE
+{'═' * 60}{C.RESET}
+
+  Coordination score: {C.RED}{C.BOLD}{cs.get('score', 0):.0%}{C.RESET} — {cs.get('verdict', '?')}
+
+  {C.DIM}This was demo data. To search X for real:{C.RESET}
+  {C.BOLD}python3 {os.path.basename(__file__)}{C.RESET}
+  {C.DIM}Then choose option (a) and enter the phrase you're investigating.{C.RESET}
+""")
+
+
+def open_visualization(script_dir, json_path, report=None):
+    """Create and open the 3D visualization."""
+    viz_path = os.path.join(script_dir, "coordination_web.html")
+    if not os.path.exists(viz_path):
+        warn(f"coordination_web.html not found at {viz_path}")
+        info("Download it from github.com/Cosmolalia/Lysis-Unraveler")
+        return
+
+    auto_viz = json_path.replace(".json", "_viz.html")
+    create_autoload_viz(viz_path, json_path, auto_viz)
+    success(f"3D visualization → {auto_viz}")
+
+    import webbrowser
+    webbrowser.open(f"file://{os.path.abspath(auto_viz)}")
+    info("Opening in your browser...")
 
 
 def create_autoload_viz(template_path, json_path, output_path):
@@ -880,13 +1156,11 @@ def create_autoload_viz(template_path, json_path, output_path):
     with open(json_path) as f:
         json_data = f.read()
 
-    # Inject auto-load script before closing </body>
     inject = f"""
 <script>
 // Auto-load report data
 (function() {{
   const data = {json_data};
-  // Wait for page load, then auto-load
   window.addEventListener('load', () => {{
     setTimeout(() => loadReport(data), 500);
   }});
@@ -897,6 +1171,89 @@ def create_autoload_viz(template_path, json_path, output_path):
 
     with open(output_path, "w") as f:
         f.write(html)
+
+
+# ── CLI Entrypoint ─────────────────────────────────────────────────────
+
+async def main():
+    """Main entrypoint — wizard mode if no args, CLI mode if args given."""
+    if len(os.sys.argv) <= 1:
+        # No arguments: run the wizard
+        await wizard()
+        return
+
+    # Arguments given: run in CLI mode (for scripting/advanced users)
+    parser = argparse.ArgumentParser(
+        description="Detect coordinated inauthentic behavior on X",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Run with no arguments for interactive wizard mode.
+
+Examples:
+  python3 x_coordination_detector.py                           # wizard
+  python3 x_coordination_detector.py "phrase to search"        # direct
+  python3 x_coordination_detector.py "phrase" --max-scroll 25  # more posts
+  python3 x_coordination_detector.py --demo                    # demo mode
+        """
+    )
+    parser.add_argument("query", nargs="?", default=None, help="Phrase to search for on X")
+    parser.add_argument("--demo", action="store_true", help="Run with demo data (no X login needed)")
+    parser.add_argument("--max-scroll", type=int, default=15, help="Max scrolls (default: 15)")
+    parser.add_argument("--headless", action="store_true", help="Run browser without window (needs saved cookies)")
+    parser.add_argument("--output", "-o", default=None, help="Output JSON path")
+    parser.add_argument("--cookies", default=None, help="Cookie file path")
+    parser.add_argument("--no-viz", action="store_true", help="Skip 3D visualization")
+    args = parser.parse_args()
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    banner()
+
+    if args.demo:
+        os.environ["LYSIS_NO_PROMPT"] = "1"
+        await run_demo(script_dir)
+        return
+
+    if not args.query:
+        await wizard()
+        return
+
+    output_path = args.output or os.path.join(script_dir, "coordination_report.json")
+    cookie_path = args.cookies or os.path.join(script_dir, ".x_cookies.json")
+
+    step(1, f'Searching X for: "{args.query}"')
+    info(f"Max scrolls: {args.max_scroll} | Output: {output_path}")
+
+    posts, profiles = await collect_posts(
+        args.query,
+        max_scrolls=args.max_scroll,
+        headless=args.headless,
+        cookie_file=cookie_path,
+    )
+
+    if not posts:
+        error("No posts found.")
+        return
+
+    success(f"Collected {len(posts)} posts.")
+
+    step(2, "Analyzing...")
+    report = analyze_coordination(posts, profiles, args.query)
+    text_report = generate_report(report)
+    print("\n" + text_report)
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    success(f"JSON → {output_path}")
+
+    text_path = output_path.replace(".json", "_report.txt")
+    with open(text_path, "w") as f:
+        f.write(text_report)
+    success(f"Text → {text_path}")
+
+    if not args.no_viz:
+        open_visualization(script_dir, output_path, report)
 
 
 if __name__ == "__main__":
